@@ -1,5 +1,5 @@
-/* Editor hints for vim
- * vim:set ts=4 sw=4 fileencoding=utf-8 fileformat=unix noexpandtab: */
+/* vim:set ts=4 sw=4 fileformat=unix fileencoding=utf-8 noexpandtab:  */
+
 /**\file
  * \brief  Weather senor (standalone server variant)
  * \author Ralf Schröder
@@ -8,7 +8,7 @@
  *
  */ 
 
-#undef CLIENT
+#define CLIENT
 #define WITH_LED
 
 #include <ESP8266WiFi.h>
@@ -28,8 +28,21 @@
 #define ledOFF()
 #endif
 
-static const char* ssid = "ssid";
-static const char* password = "password";
+#include "auth.h"
+
+#ifndef WLAN_SSID
+#define WLAN_SSID "SSID"
+#endif
+#ifndef WLAN_PASSWORD
+#define WLAN_PASSWORD "geheim"
+#endif
+#ifndef DB_SECRET
+#define DB_SECRET "geheim"
+#endif
+
+
+static const char* ssid = WLAN_SSID;
+static const char* password = WLAN_PASSWORD;
 static const int interval_sec = 60;  // >= 2
 
 static const int data_max = 24 * 3600 / interval_sec;  // 1 day
@@ -55,12 +68,12 @@ class myServer: public ESP8266WebServer
 // Create an instance of the server
 // specify the port to listen on as an argument
 static myServer server(80);
+static unsigned reconnect_timeout;
 
 
 #ifdef CLIENT
 static WiFiClient client;
 static unsigned client_timeout;
-static unsigned reconnect_timeout;
 #endif /* CLIENT */
 
 // Sensor object
@@ -85,10 +98,7 @@ static void deep_sleep()
 	if (wait > 60000) { wait = 60000; }
 	Serial.println(String("sleeping ") + wait + "msec at: " + millis());
 	delay(wait);
-	ESP.deepSleep(wait*1000);
-	delay(100);
 	Serial.println(String("wakeup: ") + millis());
-#endif
 }
 
 #ifdef CLIENT
@@ -303,12 +313,12 @@ static void onGraph()
 		"<polyline points=\"";
 	String str2 = String("\" style=\"fill:none;stroke:MediumBlue;stroke-width:2\" />\n<polyline points=\"");
 	String str3 = String("\" style=\"fill:none;stroke:DarkGreen;stroke-width:2\" />\n");
-	String str4 = String("<text x=\"") + (data_max/2) + "\" y=\"" + (t_norm + 75) + "\" fill=\"MediumBlue\">24h Temperatur " + (t_min/10) + "-" + (t_max/10) + "Â°C</text>\n"
+	String str4 = String("<text x=\"") + (data_max/2) + "\" y=\"" + (t_norm + 75) + "\" fill=\"MediumBlue\">24h Temperatur " + (t_min/10) + "-" + (t_max/10) + "°C</text>\n"
 		"<text x=\"100\" y=\""                          + (t_norm + 75) + "\" fill=\"DarkGreen\">24h Luftfeuchtigkeit 0-100%</text>\n"
 		"</svg>\n\r\n";
 
 	len = (str1.length() + str2.length() + 20 * data_max + str3.length() + str4.length());
-	len += (sizeof("<text x=\"15\" y=\"0000\" fill=\"MediumBlue\">000Â°C</text>\n" "<text x=\"0000\" y=\"0000\" fill=\"MediumBlue\">000%</text>\n") - 1) * (t_norm / 50 + 1);
+	len += (sizeof("<text x=\"15\" y=\"0000\" fill=\"MediumBlue\">000°C</text>\n" "<text x=\"0000\" y=\"0000\" fill=\"MediumBlue\">000%</text>\n") - 1) * (t_norm / 50 + 1);
 	server.prepareHeader(200, "image/svg+xml", len);
 	server.sendContent(str1); sent = str1.length();
 
@@ -334,7 +344,7 @@ static void onGraph()
 	for (x = 0; x <= t_norm / 50; x++)
 	{
 		sent += snprintf(buf, sizeof(buf),
-				"<text x=\"%d\" y=\"%d\" fill=\"MediumBlue\">%2dÂ°C</text>\n"
+				"<text x=\"%d\" y=\"%d\" fill=\"MediumBlue\">%2d°C</text>\n"
 				"<text x=\"5\" y=\"%d\" fill=\"DarkGreen\">%3d%%</text>\n",
 				data_max + step_v + 5,
 				55 + x * 50, (t_max - x * 50) / 10,
