@@ -1,5 +1,7 @@
 <?php
-$now = time();
+$endTime = new DateTime(date_create('NOW')->format('Y-m-d H:00:00')):
+$endTime->add(date_interval_create_from_date_string('1 hour'));
+$endHour = intval(endTime->format('H'));
 $pdo = new PDO('mysql:host=localhost;dbname=weather_station', 'pi', 'geheim');
 $sql = "SELECT datum, temp, humidity FROM temperature WHERE sender_id = 'Ralfs Testsensor' AND datum >= DATE_SUB(NOW(), INTERVAL 24 HOUR) ORDER BY datum";
 $stmt = $pdo->prepare($sql);
@@ -43,7 +45,8 @@ echo
 	foreach( $data as $index => $row)
 	{
 		$t = date_create($row['datum']);
-		$i = 24 * 60 - intval(($now - $t->format("U")) / 60);
+		$i = 24 * 60 - intval(($endTime - $t->format("U")) / 60);
+		if ($i < 0) { continue; }
 		if ($startet && ($last + 5 < $i))
 		{
 			echo '" style="fill:none;stroke:MediumBlue;stroke-width:2" />';
@@ -60,7 +63,7 @@ echo
 	foreach( $data as $index => $row)
 	{
 		$t = date_create($row['datum']);
-		$i = 24 * 60 - intval(($now - $t->format("U")) / 60);
+		$i = 24 * 60 - intval(($endTime - $t->format("U")) / 60);
 		if ($startet && ($last + 5 < $i))
 		{
 			echo '" style="fill:none;stroke:MediumBlue;stroke-width:2" />';
@@ -71,6 +74,13 @@ echo
 		$last = $i;
 	}
 	if ($startet) { echo '" style="fill:none;stroke:DarkGreen;stroke-width:2" />'; }
+	for($x = 0; $x <= 24; $x++)
+	{
+		$h = $endHour - (24 - $x);
+		if ($h < 0) { $h += 24; }
+		echo '
+	<text x="'.($step_v * $x).'" y="20" fill="Black">'.$h.'</text>'
+	}
 	for ($x = 0; $x <= $t_norm / 50; $x++)
 	{
 		echo '
