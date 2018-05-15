@@ -180,7 +180,8 @@ void setup()
 		"128Mbits. Map : 1024KBytes + 1024KBytes"
 		};
 
-	TRACE("%s reset reason: %s flash: %s\n", __func__, RST_REASONS[resetInfo->reason], FLASH_MAP[fmap]);
+	TRACE("%s reset reason: %s/%s flash: %s size: %u real %u speed %u freq %uMHz scetch %u free %u Vcc: %u\n", __func__, RST_REASONS[resetInfo->reason], ESP.getResetInfo().c_str(), FLASH_MAP[fmap],
+		 ESP.getFlashChipSize(), ESP.getFlashChipRealSize(), getFlashChipSpeed(), ESP.getCpuFreqMHz(), ESP.getSketchSize(), ESP.getFreeSketchSpace(), ESP.getVcc());
 #endif
 
 	// Connect to WiFi network
