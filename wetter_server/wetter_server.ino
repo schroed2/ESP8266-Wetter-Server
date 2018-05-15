@@ -8,12 +8,13 @@
  *
  */ 
 
-#undef WITH_LED       /**< activate the onboard LED for testing, use the given LED */
+#define WITH_LED 2    /**< activate the onboard LED for testing, use the given LED */
 #define WITH_SERIAL   /**< activate the serial printings for testing */
-#undef  CLIENT        /**< additional data transmittion as for wetter_sensor */
+#define CLIENT        /**< additional data transmittion as for wetter_sensor */
 #define WITH_OTA      /**< Integrate over the air update */
 #define VERSION "0.9" /**< Version */ 
-#define BUILD 6       /**< Build number */ 
+#define BUILD 1       /**< Build number */ 
+ADC_MODE(ADC_VCC)     /**< vcc read */
 
 #include "auth.h"
 
@@ -32,7 +33,7 @@ static const char* ssid = WLAN_SSID;
 static const char* password = WLAN_PASSWORD;
 static const int interval_sec = 60;  // >= 2
 static const int data_max = 24 * 3600 / interval_sec;  // 1 day
-static const char* sensor_id = "Ralfs Testsensor"; //< ID for data base separation, could be the sensor location name */
+static const char* sensor_id = "Ralfs Wetterstation"; //< ID for data base separation, could be the sensor location name */
 
 #ifdef CLIENT
 static const char* weather_server = "raspi.fritz.box";
@@ -100,7 +101,7 @@ static unsigned long client_timeout;
 #endif /* CLIENT */
 
 // Sensor object
-static DHT dht(2, DHT22);
+static DHT dht(D2, DHT22);
 static unsigned long data_next;          /**< time to read the sensor (millis value) */
 
 
@@ -148,7 +149,9 @@ static void transmit_msg(float temperature, float humidity)
 {
 	if (client.connect(weather_server, weather_port))
 	{
-		unsigned jlen = snprintf(buf, sizeof(buf), "{\"sender_id\":\"%s\",\"password\":\"" DB_SECRET "\",\"temperature\":%.1f,\"humidity\":%.1f}\r\n", sensor_id, temperature, humidity);
+		unsigned jlen = snprintf(buf, sizeof(buf), 
+				"{\"sender_id\":\"%s\",\"password\":\"" DB_SECRET "\",\"temperature\":%.1f,\"humidity\":%.1f,\"vcc\":%.2f}\r\n",
+				sensor_id, temperature, humidity, ESP.getVcc() / 1000.0);
 		char* header = buf + jlen + 1;
 		snprintf(header, sizeof(buf)-jlen-1,
 				"POST /esp8266_trigger HTTP/1.1\r\n"
@@ -168,8 +171,9 @@ static void transmit_msg(float temperature, float humidity)
 #endif /* CLIENT */
 
 
-static void sensorRead()
+static bool sensorRead()
 {
+	bool ret;
 	ledON();
 
 	if (++data_index >= data_max) {
@@ -178,27 +182,25 @@ static void sensorRead()
 	}
 	data[data_index].temp = data[data_index].hum = -1;
 
-	float t, h;
-	int count;
-	for (count = 0; count < 5; count++) {
-		t = dht.readTemperature();
-		h = dht.readHumidity();
-		if (!isnan(t) && !isnan(h))
-		{
-			data[data_index].temp = (int)(t * 10 + 0.5);
-			data[data_index].hum = (int)(h * 10 + 0.5);
+	float t = dht.readTemperature();
+	float h = dht.readHumidity();
+	if (!isnan(t) && !isnan(h))
+	{
+		data[data_index].temp = (int)(t * 10 + 0.5);
+		data[data_index].hum = (int)(h * 10 + 0.5);
 #ifdef CLIENT
-			transmit_msg(t, h);
+		transmit_msg(t, h);
 #endif /* CLIENT */
-			break;
-		}
+		TRACE("Index:%d/%d Temperatur: %d.%d°C Luftfeuchtikeit: %d.%d%%\n",
+				data_overrun, data_index, data[data_index].temp / 10, data[data_index].temp % 10, data[data_index].hum / 10, data[data_index].hum % 10);
+		ret = true;
+	} else {
 		TRACE("%s: reading sensor failed, try again\n", __func__);
-		delay(2000);
+		ret = false;
 	}
 
-	TRACE("Index:%d/%d Temperatur: %d.%d°C Luftfeuchtikeit: %d.%d%%\n",
-			data_overrun, data_index, data[data_index].temp / 10, data[data_index].temp % 10, data[data_index].hum / 10, data[data_index].hum % 10);
 	ledOFF();
+	return ret;
 }
 
 
@@ -413,11 +415,34 @@ static void onGraph()
 static const int NTP_PACKET_SIZE = 48; // NTP time is in the first 48 bytes of message
 static byte packetBuffer[NTP_PACKET_SIZE]; //buffer to hold incoming & outgoing packets
 
+// send an NTP request to the time server at the given address
+static void sendNTPpacket()
+{
+	// set all bytes in the buffer to 0
+	memset(packetBuffer, 0, NTP_PACKET_SIZE);
+	// Initialize values needed to form NTP request
+	// (see URL above for details on the packets)
+	packetBuffer[0] = 0b11100011;   // LI, Version, Mode
+	packetBuffer[1] = 0;     // Stratum, or type of clock
+	packetBuffer[2] = 6;     // Polling Interval
+	packetBuffer[3] = 0xEC;  // Peer Clock Precision
+	// 8 bytes of zero for Root Delay & Root Dispersion
+	packetBuffer[12]  = 49;
+	packetBuffer[13]  = 0x4E;
+	packetBuffer[14]  = 49;
+	packetBuffer[15]  = 52;
+	// all NTP fields have been given values, now
+	// you can send a packet requesting a timestamp:                 
+	Udp.beginPacket(timeServer, 123); //NTP requests are to port 123
+	Udp.write(packetBuffer, NTP_PACKET_SIZE);
+	Udp.endPacket();
+}
+
 static time_t getNtpTime()
 {
 	while (Udp.parsePacket() > 0) ; // discard any previously received packets
 	TRACE_LINE("Transmit NTP Request\n");
-	sendNTPpacket(timeServer);
+	sendNTPpacket();
 	uint32_t beginWait = millis();
 	while (millis() - beginWait < 1500) {
 		int size = Udp.parsePacket();
@@ -437,29 +462,6 @@ static time_t getNtpTime()
 	return 0; // return 0 if unable to get the time
 }
 
-// send an NTP request to the time server at the given address
-static void sendNTPpacket(IPAddress &address)
-{
-	// set all bytes in the buffer to 0
-	memset(packetBuffer, 0, NTP_PACKET_SIZE);
-	// Initialize values needed to form NTP request
-	// (see URL above for details on the packets)
-	packetBuffer[0] = 0b11100011;   // LI, Version, Mode
-	packetBuffer[1] = 0;     // Stratum, or type of clock
-	packetBuffer[2] = 6;     // Polling Interval
-	packetBuffer[3] = 0xEC;  // Peer Clock Precision
-	// 8 bytes of zero for Root Delay & Root Dispersion
-	packetBuffer[12]  = 49;
-	packetBuffer[13]  = 0x4E;
-	packetBuffer[14]  = 49;
-	packetBuffer[15]  = 52;
-	// all NTP fields have been given values, now
-	// you can send a packet requesting a timestamp:                 
-	Udp.beginPacket(address, 123); //NTP requests are to port 123
-	Udp.write(packetBuffer, NTP_PACKET_SIZE);
-	Udp.endPacket();
-}
-
 void setup()
 {
 #ifdef WITH_LED
@@ -472,6 +474,10 @@ void setup()
 	delay(10);
 	TRACE("%s serial connection online\n", __func__);
 #endif /* WITH_SERIAL */
+
+	/** Start early because we have to wait 1.5sec before first reading */
+	dht.begin();
+	data_next = millis() + 2000;
 
 	// Connect to WiFi network
 	if (WiFi.mode (WIFI_STA))
@@ -499,6 +505,7 @@ void setup()
 	data_index = data_max - 1;
 
 #ifdef WITH_OTA
+	ArduinoOTA.setHostname("wetter");
 	ArduinoOTA.onStart([]() { TRACE("Start updating %s\n", ((ArduinoOTA.getCommand() == U_FLASH) ? "sketch" : "filesystem")); });
 	ArduinoOTA.onEnd([]() { TRACE_LINE("End updating\n"); });
 	ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) 
@@ -520,10 +527,6 @@ void setup()
 			});
 	ArduinoOTA.begin();
 #endif /* WITH_OTA */
-
-	/** Start early because we have to wait 1.5sec before first reading */
-	dht.begin();
-	data_next = millis() + 2000;
 
 	// Start the server
 	server.on("/", onRoot);
@@ -574,7 +577,9 @@ void loop()
 	// we are connected with WiFi here
 
 	server.handleClient();
+#ifdef WITH_OTA
 	ArduinoOTA.handle();
+#endif /* WITH_OTA */
 
 #ifdef CLIENT
 	if (client_timeout && client.connected())
@@ -602,10 +607,14 @@ void loop()
 
 		if (millis() >= data_next)
 		{ // sensor time
-			sensorRead();
-			data_next = (data_overrun * interval_sec * data_max + (data_index + 1) * interval_sec) * 1000;
-			TRACE("%s: now:%lu next sensor read %lu\n", __func__, millis(), data_next);
-			return;
+			if (sensorRead())
+			{
+				data_next = (data_overrun * interval_sec * data_max + (data_index + 1) * interval_sec) * 1000;
+				TRACE("%s: now:%lu next sensor read %lu\n", __func__, millis(), data_next);
+				return;
+			} else {
+				data_next = millis() + 2500;
+			}
 		} 
 	}
 	/* nothing to do, sleep 1 sec */

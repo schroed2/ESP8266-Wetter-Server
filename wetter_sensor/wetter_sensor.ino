@@ -11,11 +11,12 @@
 
 /*** Personal parameter adaptations ***/
 
-#undef WITH_LED     /** activate the onboard LED for testing, use the given LED */
+#define WITH_LED 2    /** activate the onboard LED for testing, use the given LED */
 #define WITH_SERIAL   /** activate the serial printings for testing */
-#undef LIGHT_SLEEP    /**< no deep sleep if defined, attend the link XPD_DCDC->RST for deep sleep */
+#define LIGHT_SLEEP   /**< no deep sleep if defined, attend the link XPD_DCDC->RST for deep sleep */
 #define VERSION "0.9" /**< Version */ 
 #define BUILD 1       /**< Build number */ 
+ADC_MODE(ADC_VCC);    /**< vcc read */
 
 #include "auth.h"
 
@@ -156,16 +157,6 @@ void setup()
 	Serial.begin(115200);
 	delay(10);
 	TRACE("%s serial connection online\n", __func__);
-	const rst_info * resetInfo = system_get_rst_info();
-	const char * const RST_REASONS[] = {
-		"REASON_DEFAULT_RST",
-		"REASON_WDT_RST",
-		"REASON_EXCEPTION_RST",
-		"REASON_SOFT_WDT_RST",
-		"REASON_SOFT_RESTART",
-		"REASON_DEEP_SLEEP_AWAKE",
-		"REASON_EXT_SYS_RST"
-	};
 	enum flash_size_map fmap = system_get_flash_size_map();
 	const char * const FLASH_MAP[] = {
 		"4Mbits. Map : 256KBytes + 256KBytes",
@@ -180,8 +171,10 @@ void setup()
 		"128Mbits. Map : 1024KBytes + 1024KBytes"
 		};
 
-	TRACE("%s reset reason: %s/%s flash: %s size: %u real %u speed %u freq %uMHz scetch %u free %u Vcc: %u\n", __func__, RST_REASONS[resetInfo->reason], ESP.getResetInfo().c_str(), FLASH_MAP[fmap],
-		 ESP.getFlashChipSize(), ESP.getFlashChipRealSize(), getFlashChipSpeed(), ESP.getCpuFreqMHz(), ESP.getSketchSize(), ESP.getFreeSketchSpace(), ESP.getVcc());
+	TRACE("%s reset reason: %s flash: %s size: %u real %u speed %u freq %uMHz scetch %u free %u Vcc: %d\n",
+			__func__, ESP.getResetInfo().c_str(), FLASH_MAP[fmap],
+		 ESP.getFlashChipSize(), ESP.getFlashChipRealSize(), ESP.getFlashChipSpeed(), ESP.getCpuFreqMHz(),
+		 ESP.getSketchSize(), ESP.getFreeSketchSpace(), ESP.getVcc());
 #endif
 
 	// Connect to WiFi network
