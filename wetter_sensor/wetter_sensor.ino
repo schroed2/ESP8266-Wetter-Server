@@ -1,7 +1,7 @@
-/* vim:set ts=4 sw=4 fileformat=unix fileencoding=utf-8 noexpandtab:  */
+/* vim:set ts=4 sw=4 fileformat=unix fileencodings=utf-8 fileencoding=utf-8 noexpandtab:  */
 
 /**\file
- * \brief  Weatcher senor (power save variant)
+ * \brief  Weather sensor (power save variant)
  * \author Ralf Schröder
  *
  * (C) Feel free to change (MIT)
@@ -11,9 +11,11 @@
 
 /*** Personal parameter adaptations ***/
 
-#define WITH_LED 2    /** activate the onboard LED for testing, use the given LED */
+#undef WITH_LED     /** activate the onboard LED for testing, use the given LED */
 #define WITH_SERIAL   /** activate the serial printings for testing */
-#undef LIGHT_SLEEP   /**< no deep sleep if defined, attend the link XPD_DCDC->RST for deep sleep */
+#undef LIGHT_SLEEP    /**< no deep sleep if defined, attend the link XPD_DCDC->RST for deep sleep */
+#define VERSION "0.9" /**< Version */ 
+#define BUILD 1       /**< Build number */ 
 
 #include "auth.h"
 
@@ -31,13 +33,12 @@
 static const char* ssid = WLAN_SSID;
 static const char* password = WLAN_PASSWORD;
 static const int interval_sec = 60;  // Note: >= 2
-static const char* sensor_id = "Test-Sensor"; //< ID for data base separation, could be the sensor location name */
+static const char* sensor_id = "Ralfs Testsensor"; //< ID for data base separation, could be the sensor location name */
 
 static const char* weather_server = "raspi.fritz.box";
 static const int weather_port = 8000;
 
 
-/*** Personal parameter adaptations ***/
 #include <ESP8266WiFi.h>
 #include <DHT.h>
 
@@ -54,13 +55,11 @@ extern "C" {
 #endif
 
 #ifdef WITH_SERIAL
-#define TRACE_LINE(line) { Serial.print(line); }
-#define TRACE(args...)   { snprintf(buf, sizeof(buf), ##args); Serial.print(buf); }
-#define TRACELN(args...) { snprintf(buf, sizeof(buf), ##args); Serial.println(buf); }
+#define TRACE_LINE(line) Serial.print(line)
+#define TRACE(...)       Serial.printf(__VA_ARGS__)
 #else
 #define TRACE_LINE(line)
 #define TRACE(args...)
-#define TRACELN(args...)
 #endif
 
 static unsigned long reconnect_timeout;  /**< Reconnect timeout within loop() for lost WiFi connections (millis() value) */
@@ -69,11 +68,9 @@ static WiFiClient client;                /**< client for data transmission */
 /** If set, a data message was sent, until the set value the response should be received (millis() value). After that time hangup. */
 static unsigned long client_timeout;
 
-static DHT dht(D2, DHT22);               /**< Sensor object */
+static DHT dht(2, DHT22);               /**< Sensor object */
 static unsigned long data_next;          /**< time to read the sensor (millis value) */
 
-/** Scratch buffer to avoid expensive object management in many situations */
-static char buf[400];
 
 
 /** Deep sleep methon. I assume here, that the function continues after the sleep.
@@ -84,14 +81,14 @@ static void deep_sleep()
 	unsigned long now = millis();
 	unsigned long wait = data_next - now;
 	if (wait > 60000) { wait = 60000; }
-	TRACELN("sleeping %lu msec at: %lu", wait, now);
+	TRACE("sleeping %lu msec at: %lu\n", wait, now);
 #ifdef LIGHT_SLEEP
 	delay(wait);
 #else
 #ifdef WITH_SERIAL
 	Serial.flush();
 	Serial.end();
-	TRACELN("wakeup: %lu", millis());
+	TRACE("wakeup: %lu\n", millis());
 #endif
 	delay(100);
 	ESP.deepSleep(wait*1000);
@@ -106,6 +103,7 @@ static void transmit_msg(float temperature, float humidity)
 {
 	if (client.connect(weather_server, weather_port))
 	{
+		char buf[400];
 		unsigned jlen = snprintf(buf, sizeof(buf), "{\"sender_id\":\"%s\",\"password\":\"" DB_SECRET "\",\"temperature\":%.1f,\"humidity\":%.1f}\r\n", sensor_id, temperature, humidity);
 		char* header = buf + jlen + 1;
 		snprintf(header, sizeof(buf)-jlen-1,
@@ -119,7 +117,7 @@ static void transmit_msg(float temperature, float humidity)
 		client.print(header); client.print(buf);
 		client_timeout = millis() + 5000;   // expect answer finished after 5 sec
 	} else {
-		TRACELN("%s: no http server connection", __func__);
+		TRACE("%s: no http server connection\n", __func__);
 	}
 }
 
@@ -138,10 +136,10 @@ static void sensorRead()
 			transmit_msg(t, h);
 			break;
 		}
-		TRACELN("%s: reading sensor failed, try again", __func__);
-		delay(2000);
+		TRACE("%s: reading sensor failed, try again\n", __func__);
+		delay(2500);
 	}
-	TRACELN("Temperatur: %.1f°C Luftfeuchtikeit: %.1f%%", t, h);
+	TRACE("Temperatur: %.1f°C Luftfeuchtikeit: %.1f%%\n", t, h);
 	ledOFF();
 }
 
@@ -157,7 +155,7 @@ void setup()
 #ifdef WITH_SERIAL
 	Serial.begin(115200);
 	delay(10);
-	TRACELN("%s serial connection online", __func__);
+	TRACE("%s serial connection online\n", __func__);
 	const rst_info * resetInfo = system_get_rst_info();
 	const char * const RST_REASONS[] = {
 		"REASON_DEFAULT_RST",
@@ -168,12 +166,22 @@ void setup()
 		"REASON_DEEP_SLEEP_AWAKE",
 		"REASON_EXT_SYS_RST"
 	};
-	TRACELN("%s reset reason: %s", __func__, RST_REASONS[resetInfo->reason]);
-#endif
+	enum flash_size_map fmap = system_get_flash_size_map();
+	const char * const FLASH_MAP[] = {
+		"4Mbits. Map : 256KBytes + 256KBytes",
+		"2Mbits. Map : 256KBytes",
+		"8Mbits. Map : 512KBytes + 512KBytes",
+		"16Mbits. Map : 512KBytes + 512KBytes",
+		"32Mbits. Map : 512KBytes + 512KBytes",
+		"16Mbits. Map : 1024KBytes + 1024KBytes",
+		"32Mbits. Map : 1024KBytes + 1024KBytes",
+		"32Mbits. Map : 2048KBytes + 2048KBytes",
+		"64Mbits. Map : 1024KBytes + 1024KBytes",
+		"128Mbits. Map : 1024KBytes + 1024KBytes"
+		};
 
-	/** Start early because we have to wait 1.5sec before first reading */
-	dht.begin();
-	data_next = millis() + 2000;
+	TRACE("%s reset reason: %s flash: %s\n", __func__, RST_REASONS[resetInfo->reason], FLASH_MAP[fmap]);
+#endif
 
 	// Connect to WiFi network
 	if (WiFi.mode (WIFI_STA))
@@ -183,7 +191,7 @@ void setup()
 #if 0  // freezes after the first loop, investigate later
 		if (!WiFi.setSleepMode(WIFI_LIGHT_SLEEP))
 		{
-			TRACELN("%s: unable to set WIFI_LIGHT_SLEEP (WARNING)", __func__);
+			TRACE("%s: unable to set WIFI_LIGHT_SLEEP (WARNING)\n", __func__);
 		}
 #endif
 		for(int count = 0; count < 100; count++)
@@ -192,10 +200,15 @@ void setup()
 			delay(100);
 			TRACE(".");
 		}
-		TRACELN("\n%s: WiFi connected with %s", __func__, String(WiFi.localIP()).c_str());
+		TRACE("\n%s: WiFi connected with %s\n", __func__, WiFi.localIP().toString().c_str());
 	} else {
 		TRACE("%s: WiFi no in station mode (FATAL)", __func__);
 	}
+
+	/** Start early because we have to wait 1.5sec before first reading */
+	dht.begin();
+	data_next = millis() + 2500;
+
 	ledOFF();
 }
 
@@ -213,7 +226,7 @@ void loop()
 			TRACE(".");
 			delay(100);
 		} else if (reconnect_timeout < millis()) {
-			TRACELN("\n%s: no WLAN connection", __func__);
+			TRACE("\n%s: no WLAN connection\n", __func__);
 			reconnect_timeout = 0;
 			data_next += interval_sec;
 			deep_sleep(); // give up, wait one data interval
@@ -225,7 +238,7 @@ void loop()
 	}
 	if (reconnect_timeout)
 	{
-		TRACELN("\nWiFi reconnected with %s", String(WiFi.localIP()).c_str());
+		TRACE("\n%s: WiFi reconnected with %s\n", __func__, WiFi.localIP().toString().c_str());
 		reconnect_timeout = 0;
 	}
 	// we are connected with WiFi here
@@ -255,13 +268,13 @@ void loop()
 		{ // sensor time
 			sensorRead();
 			data_next += interval_sec * 1000;
-			TRACELN("%s: now:%lu next sensor read %lu", __func__, millis(), data_next);
+			TRACE("%s: now:%lu next sensor read %lu\n", __func__, millis(), data_next);
 			return;
 		} else {
 			unsigned wait;
 			if ((wait = data_next - millis()) < 10000)
 			{
-				TRACELN("%s: now:%lu next sensor read %lu waiting %ums", __func__, millis(), data_next, wait);
+				TRACE("%s: now:%lu next sensor read %lu waiting %ums\n", __func__, millis(), data_next, wait);
 				delay(wait);
 				return;
 			}
