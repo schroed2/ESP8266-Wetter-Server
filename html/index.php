@@ -9,9 +9,9 @@
 <p>
 </p>
 <p>Uhrzeit: <?php echo date("l Y-m-d G:i:s (e)") ?></p>
-<embed src="http://sensor1/graph.svg" type="image/svg+xml">
+<embed src="graph.php" type="image/svg+xml" width="98%" height="100%">
 <h1>Wohnzimmer</h1>
-<embed src="http://sensor2/graph.svg" type="image/svg+xml">
+<embed src="graph2.php" type="image/svg+xml" width="98%" height="100%">
 <h1>Testsensor</h1>
 <?php
 $pdo = new PDO('mysql:host=localhost;dbname=weather_station', 'pi', 'geheim');
@@ -20,6 +20,5 @@ $sql = "SELECT datum, temp, humidity FROM temperature WHERE sender_id = 'Ralfs T
 		echo "Letzter Eintrag: ".$row['datum']." Temperatur ".$row['temp']."&deg;C Luftfeuchtigkeit ".$row['humidity'];
 	}
 ?>
-<embed src="graph.php" type="image/svg+xml" width="98%" height="100%">
 </body>
 </html>

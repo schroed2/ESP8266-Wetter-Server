@@ -13,7 +13,7 @@
 #define CLIENT        /**< additional data transmittion as for wetter_sensor */
 #define WITH_OTA      /**< Integrate over the air update */
 #define VERSION "0.9" /**< Version */ 
-#define BUILD 1       /**< Build number */ 
+#define BUILD 3       /**< Build number */ 
 ADC_MODE(ADC_VCC)     /**< vcc read */
 
 #include "auth.h"
@@ -613,11 +613,11 @@ void loop()
 				TRACE("%s: now:%lu next sensor read %lu\n", __func__, millis(), data_next);
 				return;
 			} else {
-				data_next = millis() + 2500;
+				data_next = millis() + 4000;
 			}
 		} 
 	}
 	/* nothing to do, sleep 1 sec */
-	delay(1000);
+	//delay(1000);
 }
 
