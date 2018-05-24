@@ -10,10 +10,13 @@
 
 #define WITH_LED 2    /**< activate the onboard LED for testing, use the given LED */
 #define WITH_SERIAL   /**< activate the serial printings for testing */
+#define LIGHT_SLEEP   /**< no deep sleep if defined, attend the link XPD_DCDC->RST for deep sleep */
 #define CLIENT        /**< additional data transmittion as for wetter_sensor */
 #define WITH_OTA      /**< Integrate over the air update */
 #define VERSION "0.9" /**< Version */ 
-#define BUILD 3       /**< Build number */ 
+#define BUILD 9       /**< Build number */ 
+#define LOCATION "Testsensor"
+#define DHT_PIN D2
 ADC_MODE(ADC_VCC)     /**< vcc read */
 
 #include "auth.h"
@@ -28,12 +31,12 @@ ADC_MODE(ADC_VCC)     /**< vcc read */
 #define DB_SECRET "geheim"
 #endif
 
-
 static const char* ssid = WLAN_SSID;
 static const char* password = WLAN_PASSWORD;
 static const int interval_sec = 60;  // >= 2
 static const int data_max = 24 * 3600 / interval_sec;  // 1 day
-static const char* sensor_id = "Ralfs Wetterstation"; //< ID for data base separation, could be the sensor location name */
+//static const char* sensor_id = "Ralfs Wetterstation"; //< ID for data base separation, could be the sensor location name */
+static const char* sensor_id = "Ralfs " LOCATION; //< ID for data base separation, could be the sensor location name */
 
 #ifdef CLIENT
 static const char* weather_server = "raspi.fritz.box";
@@ -47,23 +50,31 @@ static const int weather_port = 8000;
 #include <TimeLib.h> 
 #include <ESP8266WebServer.h>
 #include <WiFiUdp.h>
+
 #ifdef WITH_OTA
 #include <ArduinoOTA.h>
 #endif /* WITH_OTA */
 
+#ifdef WITH_SERIAL
+extern "C" {
+#include "user_interface.h"
+}
+#endif /* WITH_SERIAL */
 
 
 #ifdef WITH_LED
 #define ledON()  digitalWrite(WITH_LED, 0)
 #define ledOFF() digitalWrite(WITH_LED, 1)
+static unsigned ledFlash;
 #else
 #define ledON()
 #define ledOFF()
 #endif /* WITH_LED */
 
 #ifdef WITH_SERIAL
-#define TRACE_LINE(line) Serial.print(line)
-#define TRACE(...)       Serial.printf(__VA_ARGS__)
+boolean doTrace = true;
+#define TRACE_LINE(line) (doTrace && Serial.print(line))
+#define TRACE(...)       (doTrace && Serial.printf(__VA_ARGS__))
 #else
 #define TRACE_LINE(line)
 #define TRACE(...)
@@ -97,11 +108,10 @@ static unsigned long reconnect_timeout;  /**< Reconnect timeout within loop() fo
 
 #ifdef CLIENT
 static WiFiClient client;
-static unsigned long client_timeout;
 #endif /* CLIENT */
 
 // Sensor object
-static DHT dht(D2, DHT22);
+static DHT dht(DHT_PIN, DHT22);
 static unsigned long data_next;          /**< time to read the sensor (millis value) */
 
 
@@ -125,20 +135,20 @@ static void deep_sleep()
 {
 	unsigned long now = millis();
 	unsigned long wait = data_next - now;
-	if (wait > 60000) { wait = 60000; }
-	TRACE("sleeping %lu msec at: %lu\n", wait, now);
 #ifdef LIGHT_SLEEP
+	if (wait > 2000) { wait = 2000; }
+	TRACE("sleeping %lu msec at: %lu\n", wait, now);
 	delay(wait);
 #else
 #ifdef WITH_SERIAL
+	if (wait > interval_sec * 1000) { wait = interval_sec * 1000; }
+	TRACE("%s %lu msec at: %lu\n", __func__, wait, now);
 	Serial.flush();
-	Serial.end();
-	TRACE("wakeup: %lu\n", millis());
 #endif /* WITH_SERIAL */
 	delay(100);
 	ESP.deepSleep(wait*1000);
-	delay(200);
-	return;
+	/* point never reached */
+	delay(1000);
 #endif /* LIGHT_SLEEP */
 }
 
@@ -147,22 +157,26 @@ static void deep_sleep()
 /** Transmit a message to a server */
 static void transmit_msg(float temperature, float humidity)
 {
-	if (client.connect(weather_server, weather_port))
+	if (0 == client.connected())
+	{
+		TRACE("connecting to http://%s:%u", weather_server, weather_port);
+		client.connect(weather_server, weather_port);
+	}
+	if (client.connected())
 	{
 		unsigned jlen = snprintf(buf, sizeof(buf), 
 				"{\"sender_id\":\"%s\",\"password\":\"" DB_SECRET "\",\"temperature\":%.1f,\"humidity\":%.1f,\"vcc\":%.2f}\r\n",
 				sensor_id, temperature, humidity, ESP.getVcc() / 1000.0);
 		char* header = buf + jlen + 1;
-		snprintf(header, sizeof(buf)-jlen-1,
+		unsigned hlen = snprintf(header, sizeof(buf)-jlen-1,
 				"POST /esp8266_trigger HTTP/1.1\r\n"
 				"Host: %s:%u\r\n"
-				"Connection: close\r\n"
+				"Connection: keep-alive\r\n"
 				"Content-Type: application/json; charset=utf-8\r\n"
 				"Content-Length: %u\r\n\r\n", weather_server, weather_port, jlen);
 		TRACE_LINE(header);
 		TRACE_LINE(buf);
-		client.print(header); client.print(buf);
-		client_timeout = millis() + 5000;   // expect answer finished after 5 sec
+		client.write(header, hlen); client.write(buf, jlen);
 	} else {
 		TRACE("%s: no http server connection\n", __func__);
 	}
@@ -180,7 +194,8 @@ static bool sensorRead()
 		data_index = 0;
 		data_overrun++;
 	}
-	data[data_index].temp = data[data_index].hum = -1;
+	data[data_index].temp = 0;
+	data[data_index].hum = -1;
 
 	float t = dht.readTemperature();
 	float h = dht.readHumidity();
@@ -191,11 +206,15 @@ static bool sensorRead()
 #ifdef CLIENT
 		transmit_msg(t, h);
 #endif /* CLIENT */
-		TRACE("Index:%d/%d Temperatur: %d.%d°C Luftfeuchtikeit: %d.%d%%\n",
-				data_overrun, data_index, data[data_index].temp / 10, data[data_index].temp % 10, data[data_index].hum / 10, data[data_index].hum % 10);
+		TRACE("Index:%d/%d Temperatur: %d.%d° Luftfeuchtikeit: %d.%d%% RSSI:%d\n",
+				data_overrun, data_index, data[data_index].temp / 10, data[data_index].temp % 10, data[data_index].hum / 10, data[data_index].hum % 10,
+				WiFi.RSSI());
 		ret = true;
 	} else {
+		digitalWrite(D0, LOW);
 		TRACE("%s: reading sensor failed, try again\n", __func__);
+		delay(20);
+		digitalWrite(D0, HIGH);
 		ret = false;
 	}
 
@@ -337,6 +356,7 @@ static void onGraph()
 	int count, t_min = 0, t_max = -10000;
 	for (count = 0; count < data_max; count++)
 	{
+		if (data[count].hum < 0) { continue; }
 		if (t_min > data[count].temp) {
 			t_min = data[count].temp;
 		}
@@ -344,7 +364,7 @@ static void onGraph()
 			t_max = data[count].temp;
 		}
 	}
-	t_min = t_min - t_min % 50 - ((t_min < 0) ? 50 : 0);
+	if (t_min < 0) { t_min = t_min - t_min % 50 - ((t_min < 0) ? 50 : 0); }
 	t_max = t_max - t_max % 50 + ((t_max > 0) ? 50 : 0);
 
 	int t_norm = t_max - t_min;
@@ -462,52 +482,101 @@ static time_t getNtpTime()
 	return 0; // return 0 if unable to get the time
 }
 
+#ifdef WITH_SERIAL
+static void wifi_trace(int status)
+{
+	switch (status)
+	{
+		case WL_CONNECTED: TRACE_LINE("WiFi: WL_CONNECTED\n"); break;
+		case WL_NO_SHIELD: TRACE_LINE("WiFi: WL_NO_SHIELD\n"); break;
+		case WL_IDLE_STATUS: TRACE_LINE("WiFi: WL_IDLE_STATUS\n"); break;
+		case WL_NO_SSID_AVAIL: TRACE_LINE("WiFi: WL_SSID_AVAIL\n"); break;
+		case WL_SCAN_COMPLETED: TRACE_LINE("WiFi: WL_SCAN_COMPLETED\n"); break;
+		case WL_CONNECT_FAILED: TRACE_LINE("WiFi: WL_CONNECT_FAILED\n"); break;
+		case WL_CONNECTION_LOST: TRACE_LINE("WiFi: WL_CONNECTION_LOST\n"); break;
+		case WL_DISCONNECTED: TRACE_LINE("WiFi: WL_DISCONNECTEDNO_SHIELD\n"); break;
+		default: TRACE("%s: illegal state %d", __func__, status); break;
+	}
+}
+#else
+#define wifi_trace(status)
+#endif
+
 void setup()
 {
 #ifdef WITH_LED
 	pinMode(WITH_LED, OUTPUT);
+	ledFlash = millis() + 5000;
 #endif /* WITH_LED */
 	ledON();
 
 #ifdef WITH_SERIAL
 	Serial.begin(115200);
-	delay(10);
-	TRACE("%s serial connection online\n", __func__);
+	delay(20);
+	enum flash_size_map fmap = system_get_flash_size_map();
+	const char * const FLASH_MAP[] = {
+		"4Mbits. Map : 256KBytes + 256KBytes",
+		"2Mbits. Map : 256KBytes",
+		"8Mbits. Map : 512KBytes + 512KBytes",
+		"16Mbits. Map : 512KBytes + 512KBytes",
+		"32Mbits. Map : 512KBytes + 512KBytes",
+		"16Mbits. Map : 1024KBytes + 1024KBytes",
+		"32Mbits. Map : 1024KBytes + 1024KBytes",
+		"32Mbits. Map : 2048KBytes + 2048KBytes",
+		"64Mbits. Map : 1024KBytes + 1024KBytes",
+		"128Mbits. Map : 1024KBytes + 1024KBytes"
+		};
+
+	TRACE("%s reset reason: %s flash: %s size: %u real %u speed %u freq %uMHz scetch %u free %u Vcc: %d\n",
+			__func__, ESP.getResetInfo().c_str(), FLASH_MAP[fmap],
+		 ESP.getFlashChipSize(), ESP.getFlashChipRealSize(), ESP.getFlashChipSpeed(), ESP.getCpuFreqMHz(),
+		 ESP.getSketchSize(), ESP.getFreeSketchSpace(), ESP.getVcc());
 #endif /* WITH_SERIAL */
 
 	/** Start early because we have to wait 1.5sec before first reading */
+	pinMode(D0, OUTPUT);
+	digitalWrite(D0, HIGH);
 	dht.begin();
 	data_next = millis() + 2000;
 
 	// Connect to WiFi network
-	if (WiFi.mode (WIFI_STA))
+#ifdef WITH_SERIAL
+	WiFi.onStationModeGotIP([](const WiFiEventStationModeGotIP& event) 
+			{ TRACE("WiFI connected on %s channel%u, IP: %s\n", WiFi.SSID().c_str(), WiFi.channel(), WiFi.localIP().toString().c_str()); }
+		);
+
+	WiFi.onStationModeDisconnected([](const WiFiEventStationModeDisconnected& event)
+			{ TRACE("Station disconnected from %s, reason %d\n", event.ssid.c_str(), event.reason ); }
+		);
+#endif /* WITH_SERIAL */
+
+	if (WL_NO_SSID_AVAIL == WiFi.begin())
 	{
-		TRACE("%s: Connecting to %s", __func__, ssid);
+		TRACE("Connecting to %s", ssid);
 		WiFi.begin(ssid, password);
-#if 0  // freezes after the first loop, investigate later
-		if (!WiFi.setSleepMode(WIFI_LIGHT_SLEEP))
-		{
-			TRACE("%s: unable to set WIFI_LIGHT_SLEEP (WARNING)\n", __func__);
-		}
-#endif
-		for(int count = 0; count < 100; count++)
-		{
+	} else {
+		TRACE("Connecting to persistent %s", WiFi.SSID().c_str());
+	}
+	if (!WiFi.getAutoConnect()) { WiFi.setAutoConnect(true); }
+	WiFi.setAutoReconnect(true);
+
+	for(int count = 0; count < 100; count++)
+	{
 			if (WiFi.status() == WL_CONNECTED) { break; }
 			delay(100);
 			TRACE(".");
-		}
-		TRACE("\n%s: WiFi connected with %s\n", __func__, WiFi.localIP().toString().c_str());
-	} else {
-		TRACE("%s: WiFi no in station mode (FATAL)", __func__);
 	}
+	wifi_trace(WiFi.status());
 
 	for(data_index = 0; data_index < data_max; data_index++) { data[data_index].hum = -1; }
 	data_index = data_max - 1;
 
 #ifdef WITH_OTA
-	ArduinoOTA.setHostname("wetter");
+	ArduinoOTA.setHostname(LOCATION);
+#ifdef WITH_SERIAL
 	ArduinoOTA.onStart([]() { TRACE("Start updating %s\n", ((ArduinoOTA.getCommand() == U_FLASH) ? "sketch" : "filesystem")); });
 	ArduinoOTA.onEnd([]() { TRACE_LINE("End updating\n"); });
+#endif /* WITH_SERIAL */
 	ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) 
 	{ 
 		TRACE("Progress: %u%%\r", (progress / (total / 100))); 
@@ -517,6 +586,7 @@ void setup()
 		led = !led;
 #endif /* WITH_LED */
 	});
+#ifdef WITH_SERIAL
 	ArduinoOTA.onError([](ota_error_t error) {
 			TRACE("Error[%u]: ", error);
 			if (error == OTA_AUTH_ERROR) TRACE_LINE("Auth Failed\n");
@@ -525,6 +595,7 @@ void setup()
 			else if (error == OTA_RECEIVE_ERROR) TRACE_LINE("Receive Failed\n");
 			else if (error == OTA_END_ERROR) TRACE_LINE("End Failed\n");
 			});
+#endif /* WITH_SERIAL */
 	ArduinoOTA.begin();
 #endif /* WITH_OTA */
 
@@ -536,6 +607,9 @@ void setup()
 	server.on("/led0", onLedOFF);
 	server.on("/temperature", onTemperature);
 	server.on("/humidity", onHumidity);
+#ifdef WITH_SERIAL
+	server.on("/trace", []() { doTrace = !doTrace; server.send(200, "text/play", "ok"); });
+#endif /* WITH_SERIAL */
 	server.on("/sensor", onSensor);
 	server.onNotFound(handleNotFound);
 	server.begin();
@@ -544,24 +618,36 @@ void setup()
 	Udp.begin(localPort);
 	TRACE("waiting for time sync, port %u\n", Udp.localPort());
 	setSyncProvider(getNtpTime);
+
+#ifdef CLIENT
+	client.connect(weather_server, weather_port);
+#endif /* CLIENT */
 	ledOFF();
 }
 
 void loop()
 {
+#ifdef WITH_LED
+	if (ledFlash <= millis()) { ledON(); ledFlash += 5000; }
+#endif /* WITH_LED */
+
 	/** Check WiFi connection first */
 	if (WiFi.status() != WL_CONNECTED)
 	{
 		if (!reconnect_timeout)
 		{
-			TRACE("%s: await reconnecting to %s", __func__, ssid);
+			ledON();
+			wifi_trace(WiFi.status());
+			TRACE("%s: await reconnecting", __func__);
 			reconnect_timeout = millis() + 5000;
 			TRACE(".");
 			delay(100);
 		} else if (reconnect_timeout < millis()) {
+			wifi_trace(WiFi.status());
 			TRACE("\n%s: no WLAN connection\n", __func__);
 			reconnect_timeout = 0;
 			data_next += interval_sec;
+			ledOFF();
 			deep_sleep(); // give up, wait one data interval
 		} else {
 			TRACE(".");
@@ -573,6 +659,7 @@ void loop()
 	{
 		TRACE("\nWiFi reconnected with %s\n", WiFi.localIP().toString().c_str());
 		reconnect_timeout = 0;
+		ledOFF();
 	}
 	// we are connected with WiFi here
 
@@ -582,42 +669,23 @@ void loop()
 #endif /* WITH_OTA */
 
 #ifdef CLIENT
-	if (client_timeout && client.connected())
+	if (client.connected())
 	{  // await the data answer
-		if (client_timeout < millis())
-		{
-			TRACE_LINE("\nWiFi: stop client connection");
-			client.stop();
-			client_timeout = 0;
-		} else {
-			while (client.available()) { TRACE("%c", client.read()); }
-			if (client.connected())
-			{
-				delay(10);
-			} else {
-				TRACE_LINE("\nWiFi: client connection finished\n");
-				client_timeout = 0;
-				client.stop();
-			}
-		}
-		return;
-	} else 
-#endif /* CLIENT */
-	{
-
-		if (millis() >= data_next)
-		{ // sensor time
-			if (sensorRead())
-			{
-				data_next = (data_overrun * interval_sec * data_max + (data_index + 1) * interval_sec) * 1000;
-				TRACE("%s: now:%lu next sensor read %lu\n", __func__, millis(), data_next);
-				return;
-			} else {
-				data_next = millis() + 4000;
-			}
-		} 
+		while (client.available()) { char c = client.read(); TRACE("%c", c); }
 	}
-	/* nothing to do, sleep 1 sec */
-	//delay(1000);
+#endif /* CLIENT */
+
+	if (millis() >= data_next)
+	{ // sensor time
+		if (sensorRead())
+		{
+			data_next = (data_overrun * interval_sec * data_max + (data_index + 1) * interval_sec) * 1000;
+			TRACE("%s: now:%lu next sensor read %lu\n", __func__, millis(), data_next);
+			return;
+		} else {
+			data_next = millis() + 4000;
+		}
+	} 
+	ledOFF();
 }
 
