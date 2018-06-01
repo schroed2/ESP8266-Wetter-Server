@@ -5,21 +5,35 @@
 </style>
 </head>
 <body>
-<h1>Ralfs Wetterstation</h1>
-<p>
-</p>
-<p>Uhrzeit: <?php echo date("l Y-m-d G:i:s (e)") ?></p>
-<embed src="graph.php" type="image/svg+xml" width="98%" height="500">
-<h1>Wohnzimmer</h1>
-<embed src="graph2.php" type="image/svg+xml" width="98%" height="500">
-<h1>Testsensor</h1>
-<?php
+<?php 
+setlocale(LC_TIME, 'de_DE.utf8');
+echo "<p>Aktuelle Uhrzeit".strftime('%A %e.%B %T %G (%Z)')."</p>";
 $pdo = new PDO('mysql:host=localhost;dbname=weather_station', 'pi', 'geheim');
+
+echo '<h1>Ralfs Wetterstation</h1>';
+$sql = "SELECT datum, temp, humidity FROM temperature WHERE sender_id = 'Ralfs Wetterstation' ORDER BY datum DESC LIMIT 1";
+	foreach ($pdo->query($sql) as $row) {
+		echo "<p>Letzte Messung ".$row['datum']." Temperatur ".$row['temp']."&deg;C Luftfeuchtigkeit ".$row['humidity']."</p>";
+	}
+echo '
+</p>
+<embed src="graph.php?sensor=Ralfs%20Wetterstation" type="image/svg+xml" width="98%" height="500">
+
+
+<h1>Wohnzimmer</h1>';
+$sql = "SELECT datum, temp, humidity FROM temperature WHERE sender_id = 'Ralfs Wohnzimmer' ORDER BY datum DESC LIMIT 1";
+	foreach ($pdo->query($sql) as $row) {
+		echo "<p>Letzte Messung ".$row['datum']." Temperatur ".$row['temp']."&deg;C Luftfeuchtigkeit ".$row['humidity']."</p>";
+	}
+echo '
+<embed src="graph.php?sensor=Ralfs%20Wohnzimmer" type="image/svg+xml" width="98%" height="500">
+
+<h1>Testsensor</h1>';
 $sql = "SELECT datum, temp, humidity FROM temperature WHERE sender_id = 'Ralfs Testsensor' ORDER BY datum DESC LIMIT 1";
 	foreach ($pdo->query($sql) as $row) {
-		echo "Letzter Eintrag: ".$row['datum']." Temperatur ".$row['temp']."&deg;C Luftfeuchtigkeit ".$row['humidity'];
+		echo "Letzte Messung: ".$row['datum']." Temperatur ".$row['temp']."&deg;C Luftfeuchtigkeit ".$row['humidity'];
 	}
 ?>
-<embed src="graph3.php" type="image/svg+xml" width="98%" height="500">
+<embed src="graph.php?sensor=Ralfs%20Testsensor" type="image/svg+xml" width="98%" height="500">
 </body>
 </html>

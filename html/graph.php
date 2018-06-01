@@ -1,9 +1,16 @@
 <?php
+setlocale(LC_TIME, 'de_DE.utf8');
+if (!empty($_GET['db'])) { $db = $_GET['db']; } else { $db = 'weather_station'; }
+if (!empty($_GET['sensor'])) { $sensor = $_GET['sensor']; } else { $sensor = 'Ralfs Wetterstation'; }
+if (!empty($_GET['offset'])) { $hour_offset = -$_GET['offset'] + 1; } else { $hour_offset = 1; }
+
 $endTime = new DateTime(date_create('NOW')->format('Y-m-d H:00:00'));
-$endTime->add(date_interval_create_from_date_string('1 hour'));
+$endTime->add(date_interval_create_from_date_string("$hour_offset hour"));
 $endHour = intval($endTime->format('H'));
-$pdo = new PDO('mysql:host=localhost;dbname=weather_station', 'pi', 'geheim');
-$sql = "SELECT datum, temp, humidity FROM temperature WHERE sender_id = 'Ralfs Wetterstation' AND datum >= DATE_SUB(NOW(), INTERVAL 24 HOUR) ORDER BY datum";
+$pdo = new PDO("mysql:host=localhost;dbname=$db", 'pi', 'geheim');
+$right = -$hour_offset + 1;
+$left = $right + 24;
+$sql = "SELECT datum, temp, humidity FROM temperature WHERE sender_id = '$sensor' AND datum >= DATE_SUB(NOW(), INTERVAL $left HOUR) AND datum <= DATE_SUB(NOW(), INTERVAL $right HOUR) ORDER BY datum";
 $stmt = $pdo->prepare($sql);
 $stmt->execute();
 $t_min = 0; $t_max = 0;
@@ -89,7 +96,9 @@ echo
 	<text x="5" y="'.(55 + $x * 50).'" fill="DarkGreen">'.intval(100 - 5000 * $x / $t_norm).'%</text>
 ';
 	}
-echo '	<text x="'.intval(($data_max/2)).'" y="'.($t_norm + 75).'" fill="MediumBlue">24h Temperatur '.($t_min/10).'-'.($t_max/10).'&deg;C</text>
+echo '	
+	<text x="'.intval(($data_max) - 120).'" y="'.($t_norm + 75).'">'.strftime("%A %e.%B", $endTime->format("U")).'</text>
+	<text x="'.intval(($data_max/2)).'" y="'.($t_norm + 75).'" fill="MediumBlue">24h Temperatur '.($t_min/10).'-'.($t_max/10).'&deg;C</text>
 	<text x="100" y="'.($t_norm + 75).'" fill="DarkGreen">24h Luftfeuchtigkeit 0-100%</text>
 </svg>
 ';
