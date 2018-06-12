@@ -39,7 +39,7 @@ ADC_MODE(ADC_VCC);    /**< vcc read */
 
 static const char* ssid = WLAN_SSID;
 static const char* password = WLAN_PASSWORD;
-static const int interval_sec = 60;  // Note: >= 2
+static const int interval_sec = (5*60);  // Note: >= 2
 static const char* sensor_id = "Ralfs " LOCATION; //< ID for data base separation, could be the sensor location name */
 
 static const char* weather_server = "raspi.fritz.box";

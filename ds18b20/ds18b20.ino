@@ -8,15 +8,17 @@
  *
  */ 
 
-#define WITH_LED 2    /**< activate the onboard LED for testing, use the given LED */
+//#define WITH_LED 2    /**< activate the onboard LED for testing, use the given LED */
 #define WITH_SERIAL   /**< activate the serial printings for testing */
 #define LIGHT_SLEEP   /**< no deep sleep if defined, attend the link XPD_DCDC->RST for deep sleep */
 #define CLIENT        /**< additional data transmittion as for wetter_sensor */
-#define WITH_OTA      /**< Integrate over the air update */
+#undef WITH_OTA      /**< Integrate over the air update (not on S0) */
 #define VERSION "0.9" /**< Version */ 
-#define BUILD 12      /**< Build number */ 
-#define LOCATION "Wetterstation"
-#define DHT_PIN D2
+#define BUILD 10       /**< Build number */ 
+#undef USE_DTH        /**< DTH sensor used */
+#define USE_DS18B20   /**< DS18B20 sensor used */
+#define LOCATION "Testsensor2"
+#define SENSOR_PIN 2
 ADC_MODE(ADC_VCC)     /**< vcc read */
 
 #include "auth.h"
@@ -35,17 +37,24 @@ static const char* ssid = WLAN_SSID;
 static const char* password = WLAN_PASSWORD;
 static const int interval_sec = 60;  // >= 2
 static const int data_max = 24 * 3600 / interval_sec;  // 1 day
+static const int sensors_max = 2;  // max supported sensors
 //static const char* sensor_id = "Ralfs Wetterstation"; //< ID for data base separation, could be the sensor location name */
 static const char* sensor_id = "Ralfs " LOCATION; //< ID for data base separation, could be the sensor location name */
 
 #ifdef CLIENT
-static const char* weather_server = "raspi.fritz.box";
+static const char* weather_server = "192.168.178.31";
 static const int weather_port = 80;
 #endif /* CLIENT */
 
 
 #include <ESP8266WiFi.h>
+#ifdef USE_DTH
 #include <DHT.h>
+#endif /* USE_DTH */
+#ifdef USE_DS18B20
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#endif /* USE_DS18B20 */
 
 #include <TimeLib.h> 
 #include <ESP8266WebServer.h>
@@ -108,22 +117,34 @@ static unsigned long reconnect_timeout;  /**< Reconnect timeout within loop() fo
 
 #ifdef CLIENT
 static WiFiClient client;
-static boolean client_connected;
 #endif /* CLIENT */
 
 // Sensor object
-static DHT dht(DHT_PIN, DHT22);
+#ifdef USE_DTH
+static DHT dht(SENSOR_PIN, DHT22);
+#endif /* USE_DTH */
+#ifdef USE_DS18B20
+static OneWire oneWire(SENSOR_PIN);
+static DallasTemperature DS18B20(&oneWire);
+static uint8_t numberOfDevices;              /** connected temperature devices */
+static DeviceAddress devAddr[sensors_max];
+static boolean requested;
+#endif /* USE_DS18B20 */
 static unsigned long data_next;          /**< time to read the sensor (millis value) */
 
 
 // sensor data
+static int data_index;
+static int data_overrun = -1;
+
 static struct
 {
 	int temp;
+#ifdef USE_DTH
 	int hum;
-} data[data_max];
-static int data_index;
-static int data_overrun = -1;
+#endif /* USE_DTH */
+} data[sensors_max][data_max];
+
 
 /** Scratch buffer to avoid expensive object management in many situations */
 static char buf[600];
@@ -160,8 +181,8 @@ static void transmit_msg(float temperature, float humidity)
 {
 	if (0 == client.connected())
 	{
-		TRACE("connecting to http://%s:%u\n", weather_server, weather_port);
-		client_connected = client.connect(weather_server, weather_port);
+		TRACE("connecting to http://%s:%u", weather_server, weather_port);
+		client.connect(weather_server, weather_port);
 	}
 	if (client.connected())
 	{
@@ -172,6 +193,7 @@ static void transmit_msg(float temperature, float humidity)
 		unsigned hlen = snprintf(header, sizeof(buf)-jlen-1,
 				"POST /sensor.php HTTP/1.1\r\n"
 				"Host: %s:%u\r\n"
+				"Connection: keep-alive\r\n"
 				"Content-Type: application/json; charset=utf-8\r\n"
 				"Content-Length: %u\r\n\r\n", weather_server, weather_port, jlen);
 		TRACE_LINE(header);
@@ -187,29 +209,27 @@ static void transmit_msg(float temperature, float humidity)
 
 static bool sensorRead()
 {
-	bool ret;
+	bool ret = true;
 	ledON();
 
 	if (++data_index >= data_max) {
 		data_index = 0;
 		data_overrun++;
 	}
-	data[data_index].temp = 0;
-	data[data_index].hum = -1;
-
+	data[0][data_index].temp = -1000;
+#ifdef USE_DTH
 	float t = dht.readTemperature();
 	float h = dht.readHumidity();
 	if (!isnan(t) && !isnan(h))
 	{
-		data[data_index].temp = (int)(t * 10 + 0.5);
-		data[data_index].hum = (int)(h * 10 + 0.5);
+		data[0][data_index].temp = (int)(t * 10 + 0.5);
+		data[0][data_index].hum = (int)(h * 10 + 0.5);
 #ifdef CLIENT
 		transmit_msg(t, h);
 #endif /* CLIENT */
 		TRACE("Index:%d/%d Temperatur: %d.%d°C Luftfeuchtikeit: %d.%d%% RSSI:%d\n",
-				data_overrun, data_index, data[data_index].temp / 10, data[data_index].temp % 10, data[data_index].hum / 10, data[data_index].hum % 10,
+				data_overrun, data_index, data[0][data_index].temp / 10, data[0][data_index].temp % 10, data[0][data_index].hum / 10, data[0][data_index].hum % 10,
 				WiFi.RSSI());
-		ret = true;
 	} else {
 		digitalWrite(D0, LOW);
 		TRACE("%s: reading sensor failed, try again\n", __func__);
@@ -217,6 +237,27 @@ static bool sensorRead()
 		digitalWrite(D0, HIGH);
 		ret = false;
 	}
+#endif /* USE_DTH */
+#ifdef USE_DS18B20
+	int i;
+	float t[numberOfDevices];
+	if (!DS18B20.isConversionComplete()) 
+	{ 
+		ret = false;
+   	}
+	else {
+		for(i = 0; i < numberOfDevices; i++)
+		{
+			t[i] = DS18B20.getTempC(devAddr[i]);
+			data[i][data_index].temp = (int)(t[i] * 10 + 0.5);
+			TRACE("Sensor %d Index:%d/%d Temperatur: %d.%d°C RSSI:%d\n",
+					i+1, data_overrun, data_index, data[i][data_index].temp / 10, data[i][data_index].temp % 10, WiFi.RSSI());
+		}
+#ifdef CLIENT
+		transmit_msg(t[0], -1);
+#endif /* CLIENT */
+	}
+#endif /* USE_DS18B20 */
 
 	ledOFF();
 	return ret;
@@ -239,67 +280,109 @@ static int timeZone_de(time_t t)
 static void onRoot()
 {
 	ledON();
+	String arg = server.arg("n");
+	unsigned sensor = 0;
+	if (arg.c_str()[0]) { sensor = arg.c_str()[0] - '1'; }
+	if (sensor >= sensors_max)
+	{
+		snprintf(buf, sizeof(buf), "<html>illegal sensor %u allowed %u</html>", sensor+1, sensors_max);
+		server.send( 200, "text/html", buf);
+	} else {
+		int sec = millis() / 1000;
+		int min = sec / 60;
+		int hr = min / 60;
+		time_t t = now();
+		t += timeZone_de(t);
 
-	int sec = millis() / 1000;
-	int min = sec / 60;
-	int hr = min / 60;
-	time_t t = now();
-	t += timeZone_de(t);
-
-	snprintf(buf, sizeof(buf),
-			"<!DOCTYPE html>"
-			"<html>"
-			"<head>"
-			"<meta charset=\"utf-8\" http-equiv='refresh' content='%u'/>"
-			"<title>%s</title>"
-			"<style>"
-			"body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }"
-			"svg { width: 98%%; height: auto; }"
-			"</style>"
-			"</head>"
-			"<body>"
-			"<p>Version %s build %u</p>"
-			"<h1>%s</h1>"
-			"<p>Uhrzeit: %02d:%02d:%02d %02u.%02u.%04u Online seit: %02u:%02u:%02u</p>"
-			"<p>%u.%u&deg;C bei %u.%u%% Luftfeuchtigkeit</p>\n"
-			"<embed src=\"graph.svg\" type=\"image/svg+xml\" />"
-			"</body>"
-			"</html>",
-			interval_sec, sensor_id, VERSION, BUILD, sensor_id, hour(t), minute(t), second(t), day(t), month(t), year(t), hr, min % 60, sec % 60, data[data_index].temp / 10, data[data_index].temp % 10, data[data_index].hum / 10, data[data_index].hum % 10
-			);
-	server.send ( 200, "text/html", buf );
-	TRACE("%s\n",__func__);
+		snprintf(buf, sizeof(buf),
+				"<!DOCTYPE html>"
+				"<html>"
+				"<head>"
+				"<meta charset=\"utf-8\" http-equiv='refresh' content='%u'/>"
+				"<title>%s</title>"
+				"<style>"
+				"body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }"
+				"svg { width: 98%%; height: auto; }"
+				"</style>"
+				"</head>"
+				"<body>"
+				"<p>Version %s build %u</p>"
+				"<h1>%s</h1>"
+				"<p>Uhrzeit: %02d:%02d:%02d %02u.%02u.%04u Online seit: %02u:%02u:%02u</p>"
+				"<p>%d.%u&deg;C"
+#ifdef USE_DTH
+				"bei %u.%u%% Luftfeuchtigkeit"
+#endif /* USE_DTH */
+				"</p>\n"
+				"<embed src=\"graph.svg?n=%u\" type=\"image/svg+xml\" />"
+				"</body>"
+				"</html>",
+			interval_sec, sensor_id, VERSION, BUILD, sensor_id, hour(t), minute(t), second(t), day(t), month(t), year(t), hr, min % 60, sec % 60,
+			data[sensor][data_index].temp / 10, data[sensor][data_index].temp % 10,
+#ifdef USE_DTH
+			data[sensor][data_index].hum / 10, data[sensor][data_index].hum % 10,
+#endif /* USE_DTH */
+			sensor+1
+				);
+		server.send ( 200, "text/html", buf );
+		TRACE("%s\n",__func__);
+	}
 	ledOFF();
 }
 
 static void onTemperature()
 {
 	ledON();
-	snprintf(buf, 400, "%d.%d\n", data[data_index].temp / 10, data[data_index].temp % 10);
+	unsigned len = 0;
+	for(int i = 0; i < sensors_max; i++)
+	{
+		len = snprintf(buf+len, sizeof(buf)-len, "%d.%d\n", data[i][data_index].temp / 10, data[i][data_index].temp % 10);
+	}
 	server.send(200, "text/plain", buf);
 	TRACE_LINE(buf);
 	ledOFF();
 }
 
+#ifdef USE_DTH
 static void onHumidity()
 {
 	ledON();
-	snprintf(buf, 400, "%d.%d\n", data[data_index].hum / 10, data[data_index].hum % 10);
+	snprintf(buf, sizeof(buf), "%d.%d\n", data[0][data_index].hum / 10, data[0][data_index].hum % 10);
 	server.send( 200, "text/plain", buf);
 	TRACE_LINE(buf);
 	ledOFF();
 }
+#endif /* USE_DTH */
 
 static void onSensor()
 {
 	ledON();
-	snprintf(buf, 400, "<html>Uptime:%d Temperatur: %d.%d&deg;C Luftfeuchtikeit: %d.%d%%</html>\n",
-			data_overrun * interval_sec * data_max + data_index * interval_sec, data[data_index].temp / 10, data[data_index].temp % 10, data[data_index].hum / 10, data[data_index].hum % 10);
-	server.send( 200, "text/html", buf);
+	String arg = server.arg("n");
+	unsigned sensor = 0;
+	if (arg.c_str()[0]) { sensor = arg.c_str()[0] - '1'; }
+	if (sensor >= sensors_max)
+	{
+		snprintf(buf, sizeof(buf), "<html>illegal sensor %u allowed %u</html>", sensor+1, sensors_max);
+		server.send( 200, "text/html", buf);
+	} else {
+		snprintf(buf, sizeof(buf), "<html>Uptime:%d Temperatur: %d.%d&deg;C"
+#ifdef USE_DTH
+				" Luftfeuchtikeit: %d.%d%%"
+#endif /* USE_DTH */
+				"</html>\n",
+				data_overrun * interval_sec * data_max + data_index * interval_sec,
+				data[sensor][data_index].temp / 10, data[sensor][data_index].temp % 10
+#ifdef USE_DTH
+				,data[sensor][data_index].hum / 10, data[sensor][data_index].hum % 10
+#endif /* USE_DTH */
+				);
+		server.send( 200, "text/html", buf);
+	}
 	TRACE_LINE(buf);
 	ledOFF();
 }
 
+#ifdef WITH_LED
 static void onLedON()
 {
 	ledON();
@@ -313,6 +396,7 @@ static void onLedOFF()
 	server.send( 200, "text/html", "<html>LED OFF</html>");
 	TRACE("%s\n", __func__);
 }
+#endif /* WITH_LED */
 
 static void handleNotFound()
 {
@@ -340,9 +424,12 @@ static void onList()
 	for (count = 0; count < data_max; count++)
 	{
 		int index = (data_index + count + 1) % data_max;
-		out += -(data_max - count) * interval_sec / 60; out += '\t';
-		out += data[index].temp; out += '\t';
-		out += data[index].hum; out += '\n';
+		out += -(data_max - count) * interval_sec / 60;
+		out += '\t'; out += data[0][index].temp;
+#ifdef USE_DTH
+	   	out += '\t'; out += data[0][index].hum;
+#endif /* USE_DTH */
+	   	out += '\n';
 	}
 	server.send ( 200, "text/plain", out);
 	TRACE("%s: duration: %lu\n", __func__, millis() - now_ms);
@@ -352,80 +439,106 @@ static void onList()
 static void onGraph()
 {
 	ledON();
-	unsigned long now_ms = millis();
-	int count, t_min = 0, t_max = -10000;
-	for (count = 0; count < data_max; count++)
+	String arg = server.arg("n");
+	unsigned sensor = 0;
+	if (arg.c_str()[0]) { sensor = arg.c_str()[0] - '1'; }
+	if (sensor >= sensors_max)
 	{
-		if (data[count].hum < 0) { continue; }
-		if (t_min > data[count].temp) {
-			t_min = data[count].temp;
+		snprintf(buf, sizeof(buf), "<html>illegal sensor %u allowed %u</html>", sensor+1, sensors_max);
+		server.send( 200, "text/html", buf);
+	} else {
+		unsigned long now_ms = millis();
+		int count, t_min = 0, t_max = 0;
+		for (count = 0; count < data_max; count++)
+		{
+			if (data[sensor][count].temp <= -1000) { continue; }
+			if (t_min > data[sensor][count].temp) {
+				t_min = data[sensor][count].temp;
+			}
+			if (t_max < data[sensor][count].temp) {
+				t_max = data[sensor][count].temp;
+			}
 		}
-		if (t_max < data[count].temp) {
-			t_max = data[count].temp;
+		if (t_min < 0) { t_min = t_min - t_min % 50 - ((t_min < 0) ? 50 : 0); }
+		t_max = t_max - t_max % 50 + ((t_max > 0) ? 50 : 0);
+
+		int t_norm = t_max - t_min;
+		int sent, len;
+		int step_v = data_max / 24;  // 1h raster, 5 degree (step_h == 50)
+		String str1 = String("<svg xmlns=\"http://www.w3.org/2000/svg\" version=\"1.1\" viewBox=\"0 0 ") + (data_max + 2 * step_v) + " " + (t_norm + 100) + "\">\n"
+			"<defs><pattern id=\"grid\" patternUnits=\"userSpaceOnUse\" width=\"" + step_v + "\" height=\"50\" x=\"0\" y=\"0\""
+			" fill=\"NavajoWhite\" stroke-width=\"1\" stroke=\"grey\" stroke-dasharray=\"2,2\"><desc>Raster</desc><path d=\"M0,0 v50 h" + step_v + " v-50 z\" /></pattern></defs>\n"
+			"<rect width=\"" + data_max + "\" height=\"" + t_norm + "\" fill=\"url(#grid)\" stroke-width=\"1\" stroke=\"Black\" x=\"" + step_v + "\" y=\"50\" />\n"
+			"<polyline points=\"";
+		String str2 = String("\" style=\"fill:none;stroke:MediumBlue;stroke-width:2\" />\n"
+#ifdef USE_DTH
+				"<polyline points=\"");
+		String str3 = String("\" style=\"fill:none;stroke:DarkGreen;stroke-width:2\" />\n"
+#endif /* USE_DTH */
+				);
+		String str4 = String("<text x=\"") + (data_max/2) + "\" y=\"" + (t_norm + 75) + "\" fill=\"MediumBlue\">24h Temperatur " + (t_min/10) + "-" + (t_max/10) + "°C</text>\n"
+#ifdef USE_DTH
+			"<text x=\"100\" y=\""                          + (t_norm + 75) + "\" fill=\"DarkGreen\">24h Luftfeuchtigkeit 0-100%</text>\n"
+#endif /* USE_DTH */
+			"</svg>\n\r\n";
+
+		len = (str1.length() + str2.length() + 10 * data_max
+#ifdef USE_DTH
+				+ str3.length() + 10 * data_max
+#endif /* USE_DTH */
+				+ str4.length());
+		len += (sizeof("<text x=\"15\" y=\"0000\" fill=\"MediumBlue\">000°C</text>\n" "<text x=\"0000\" y=\"0000\" fill=\"MediumBlue\">000%</text>\n") - 1) * (t_norm / 50 + 1);
+		server.prepareHeader(200, "image/svg+xml", len);
+		server.sendContent(str1); sent = str1.length();
+
+		TRACE("%s step1: %lums\n", __func__, millis() - now_ms);
+		char buf[200];
+		int x;
+		for (x = 0; x < data_max; x++)
+		{
+			int i = (data_index + x + 1) % data_max;
+			if (data[sensor][i].temp <= -1000) { continue; }
+			sent += snprintf(buf, sizeof(buf), "%4d,%4d ", x + step_v, t_max - data[sensor][i].temp + 50); /* size 10 */
+			server.sendContent(buf);
 		}
-	}
-	if (t_min < 0) { t_min = t_min - t_min % 50 - ((t_min < 0) ? 50 : 0); }
-	t_max = t_max - t_max % 50 + ((t_max > 0) ? 50 : 0);
-
-	int t_norm = t_max - t_min;
-	int sent, len;
-	int step_v = data_max / 24;  // 1h raster, 5 degree (step_h == 50)
-	String str1 = String("<svg xmlns=\"http://www.w3.org/2000/svg\" version=\"1.1\" viewBox=\"0 0 ") + (data_max + 2 * step_v) + " " + (t_norm + 100) + "\">\n"
-		"<defs><pattern id=\"grid\" patternUnits=\"userSpaceOnUse\" width=\"" + step_v + "\" height=\"50\" x=\"0\" y=\"0\""
-		" fill=\"NavajoWhite\" stroke-width=\"1\" stroke=\"grey\" stroke-dasharray=\"2,2\"><desc>Raster</desc><path d=\"M0,0 v50 h" + step_v + " v-50 z\" /></pattern></defs>\n"
-		"<rect width=\"" + data_max + "\" height=\"" + t_norm + "\" fill=\"url(#grid)\" stroke-width=\"1\" stroke=\"Black\" x=\"" + step_v + "\" y=\"50\" />\n"
-		"<polyline points=\"";
-	String str2 = String("\" style=\"fill:none;stroke:MediumBlue;stroke-width:2\" />\n<polyline points=\"");
-	String str3 = String("\" style=\"fill:none;stroke:DarkGreen;stroke-width:2\" />\n");
-	String str4 = String("<text x=\"") + (data_max/2) + "\" y=\"" + (t_norm + 75) + "\" fill=\"MediumBlue\">24h Temperatur " + (t_min/10) + "-" + (t_max/10) + "°C</text>\n"
-		"<text x=\"100\" y=\""                          + (t_norm + 75) + "\" fill=\"DarkGreen\">24h Luftfeuchtigkeit 0-100%</text>\n"
-		"</svg>\n\r\n";
-
-	len = (str1.length() + str2.length() + 20 * data_max + str3.length() + str4.length());
-	len += (sizeof("<text x=\"15\" y=\"0000\" fill=\"MediumBlue\">000°C</text>\n" "<text x=\"0000\" y=\"0000\" fill=\"MediumBlue\">000%</text>\n") - 1) * (t_norm / 50 + 1);
-	server.prepareHeader(200, "image/svg+xml", len);
-	server.sendContent(str1); sent = str1.length();
-
-	TRACE("%s step1: %lums\n", __func__, millis() - now_ms);
-	char buf[200];
-	int x;
-	for (x = 0; x < data_max; x++)
-	{
-		int i = (data_index + x + 1) % data_max;
-		if (data[i].hum < 0) { continue; }
-		sent += snprintf(buf, sizeof(buf), "%4d,%4d ", x + step_v, t_max - data[i].temp + 50); /* size 10 */
-		server.sendContent(buf);
-	}
-	server.sendContent(str2); sent += str2.length();
-	for (x = 0; x < data_max; x++)
-	{
-		int i = (data_index + x + 1) % data_max;
-		if (data[i].hum < 0) { continue; }
-		sent += snprintf(buf, sizeof(buf), "%4d,%4d ", x + step_v, (1000 - data[i].hum) * t_norm / 1000 + 50); /* size 10 */
-		server.sendContent(buf);
-	}
-	server.sendContent(str3); sent += str3.length();
-	for (x = 0; x <= t_norm / 50; x++)
-	{
-		sent += snprintf(buf, sizeof(buf),
-				"<text x=\"%d\" y=\"%d\" fill=\"MediumBlue\">%2d°C</text>\n"
-				"<text x=\"5\" y=\"%d\" fill=\"DarkGreen\">%3d%%</text>\n",
-				data_max + step_v + 5,
-				55 + x * 50, (t_max - x * 50) / 10,
-				55 + x * 50,  100 - 5000 *x / t_norm);
-		server.sendContent(buf);
-	}
-	server.sendContent(str4); sent += str4.length();
-	while (sent < len)
-	{
-		str2 = " ";
-		while (sent++ < len && str2.length() < 256) {
-			str2 += " ";
+		server.sendContent(str2); sent += str2.length();
+#ifdef USE_DTH
+		for (x = 0; x < data_max; x++)
+		{
+			int i = (data_index + x + 1) % data_max;
+			if (data[sensor][i].temp <= -1000) { continue; }
+			sent += snprintf(buf, sizeof(buf), "%4d,%4d ", x + step_v, (1000 - data[sensor][i].hum) * t_norm / 1000 + 50); /* size 10 */
+			server.sendContent(buf);
 		}
-		server.sendContent(str2);
-	}
+		server.sendContent(str3); sent += str3.length();
+#endif /* USE_DTH */
+		for (x = 0; x <= t_norm / 50; x++)
+		{
+			sent += snprintf(buf, sizeof(buf),
+					"<text x=\"%d\" y=\"%d\" fill=\"MediumBlue\">%2d°C</text>\n"
+#ifdef USE_DTH
+					"<text x=\"5\" y=\"%d\" fill=\"DarkGreen\">%3d%%</text>\n"
+#endif /* USE_DTH */
+					,data_max + step_v + 5,
+					55 + x * 50, (t_max - x * 50) / 10
+#ifdef USE_DTH
+					,55 + x * 50,  100 - 5000 *x / t_norm
+#endif /* USE_DTH */
+					);
+			server.sendContent(buf);
+		}
+		server.sendContent(str4); sent += str4.length();
+		while (sent < len)
+		{
+			str2 = " ";
+			while (sent++ < len && str2.length() < 256) {
+				str2 += " ";
+			}
+			server.sendContent(str2);
+		}
 
-	TRACE("%s: %lums\n", __func__, millis() - now_ms);
+		TRACE("%s: %lums\n", __func__, millis() - now_ms);
+	}
 	ledOFF();
 }
 
@@ -494,7 +607,7 @@ static int wifi_trace(int status)
 		case WL_SCAN_COMPLETED: TRACE_LINE("WiFi: WL_SCAN_COMPLETED\n"); break;
 		case WL_CONNECT_FAILED: TRACE_LINE("WiFi: WL_CONNECT_FAILED\n"); break;
 		case WL_CONNECTION_LOST: TRACE_LINE("WiFi: WL_CONNECTION_LOST\n"); break;
-		case WL_DISCONNECTED: TRACE_LINE("WiFi: WL_DISCONNECTEDNO_SHIELD\n"); break;
+		case WL_DISCONNECTED: TRACE_LINE("WiFi: WL_DISCONNECTED\n"); break;
 		default: TRACE("%s: illegal state %d", __func__, status); break;
 	}
 	return status;
@@ -502,6 +615,49 @@ static int wifi_trace(int status)
 #else
 #define wifi_trace(status) status
 #endif
+
+
+
+#ifdef USE_DS18B20
+//Setting the temperature sensor
+static void setupDS18B20()
+{
+	DS18B20.begin();
+	uint8_t devs = DS18B20.getDeviceCount();
+	numberOfDevices = DS18B20.getDS18Count();
+	TRACE("%s: device count: %u/%u/%u parasite power is: %s\n", __func__, numberOfDevices, devs, sensors_max, (DS18B20.isParasitePowerMode() ? "ON" : "OFF"));
+	if (numberOfDevices > sensors_max) { numberOfDevices = sensors_max; }
+
+	data_next = millis() + 2000;
+	DS18B20.setWaitForConversion(true);
+	DS18B20.requestTemperatures();
+
+	// Loop through each device, print out address
+	for(int i=0, d=0; d < devs; d++)
+	{
+		DeviceAddress addr;
+		// Search the wire for address
+		if (DS18B20.getAddress(addr, d))
+		{
+			if (DS18B20.validFamily(addr) && (i < sensors_max) && DS18B20.getAddress(devAddr[i], d))
+			{
+				i++;
+				TRACE("%s: found device %d/%d with address: %02X %02X %02X %02X %02X %02X %02X %02X resolution: %d temperature: %f°C\n",
+					   	__func__, i, d,
+						addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], addr[6], addr[7],
+						DS18B20.getResolution(addr), DS18B20.getTempC(addr));
+			} else {
+				TRACE("%s: found other device %d with address: %02X %02X %02X %02X %02X %02X %02X %02X\n",
+					   	__func__, d, addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], addr[6], addr[7]);
+			}
+		} else {
+			TRACE("%s: found ghost device at %d/%d but could not detect address. Check power and cabling\n", __func__, i+1, devs);
+		}
+	}
+	DS18B20.setWaitForConversion(false);
+}
+#endif /* USE_DS18B20 */
+
 
 void setup()
 {
@@ -517,7 +673,7 @@ void setup()
 
 #ifdef WITH_SERIAL
 	Serial.begin(115200);
-	delay(20);
+	delay(30);
 	enum flash_size_map fmap = system_get_flash_size_map();
 	const char * const FLASH_MAP[] = {
 		"4Mbits. Map : 256KBytes + 256KBytes",
@@ -532,36 +688,62 @@ void setup()
 		"128Mbits. Map : 1024KBytes + 1024KBytes"
 		};
 
-	TRACE("%s reset reason: %s flash: %s size: %u real %u speed %u freq %uMHz scetch %u free %u Vcc: %d\n",
+	TRACE("\n-------------------\n%s reset reason: %s flash: %s size: %u real %u speed %u freq %uMHz scetch %u free %u Vcc: %d\n",
 			__func__, ESP.getResetInfo().c_str(), FLASH_MAP[fmap],
 		 ESP.getFlashChipSize(), ESP.getFlashChipRealSize(), ESP.getFlashChipSpeed(), ESP.getCpuFreqMHz(),
 		 ESP.getSketchSize(), ESP.getFreeSketchSpace(), ESP.getVcc());
 #endif /* WITH_SERIAL */
 
+#ifdef USE_DTH
 	/** Start early because we have to wait 1.5sec before first reading */
 	pinMode(D0, OUTPUT);
 	digitalWrite(D0, HIGH);
 	dht.begin();
 	data_next = millis() + 2000;
+#endif /* USE_DTH */
+#ifdef USE_DS18B20
+	setupDS18B20();
+	data_next = millis();
+	requested = true;
+#endif /* USE_DS18B20 */
 
 	// Connect to WiFi network
+#ifdef WITH_SERIAL
+	WiFi.onStationModeConnected([](const WiFiEventStationModeConnected& event)
+			{ TRACE("%s WiFI connected on %s channel%u, IP: %s\n", __func__, WiFi.SSID().c_str(), WiFi.channel(), WiFi.localIP().toString().c_str()); }
+		);
+
+	WiFi.onStationModeDisconnected([](const WiFiEventStationModeDisconnected& event)
+			{ TRACE("%s Station disconnected from %s, reason %d\n", __func__, event.ssid.c_str(), event.reason ); }
+		);
+#endif /* WITH_SERIAL */
+
 	TRACE("Connecting to %s", ssid);
 	WiFi.persistent(false);
 	WiFi.mode(WIFI_STA);
+	IPAddress ip(192,168,178,38);
+	IPAddress gw(192,168,178,1);
+	IPAddress mask(255,255,255,0);
+	WiFi.config(ip, gw, mask);
 	WiFi.begin(ssid, password);
+
 	if (WiFi.getAutoConnect()) { WiFi.setAutoConnect(false); }
 	WiFi.setAutoReconnect(false);
 
 	for(int count = 0; count < 100; count++)
 	{
 			if (WiFi.status() == WL_CONNECTED) { break; }
-			delay(100);
+			delay(50);
 			TRACE(".");
 	}
-	wifi_trace(WiFi.status());
-	TRACE("WiFI connected on %s channel%u, IP: %s\n", WiFi.SSID().c_str(), WiFi.channel(), WiFi.localIP().toString().c_str());
-
-	for(data_index = 0; data_index < data_max; data_index++) { data[data_index].hum = -1; }
+	if (WL_CONNECTED == wifi_trace(WiFi.status()))
+	{
+		TRACE("%s WiFI connected on %s channel%u, IP: %s\n", __func__, WiFi.SSID().c_str(), WiFi.channel(), WiFi.localIP().toString().c_str());
+	}
+	for(data_index = 0; data_index < data_max; data_index++)
+	{ 
+		for(int i = 0; i < sensors_max; i++) { data[i][data_index].temp = -1000; } 
+	}
 	data_index = data_max - 1;
 
 #ifdef WITH_OTA
@@ -596,26 +778,31 @@ void setup()
 	server.on("/", onRoot);
 	server.on("/graph.svg", onGraph);
 	server.on("/list", onList);
+#ifdef WITH_LED
 	server.on("/led1", onLedON);
 	server.on("/led0", onLedOFF);
+#endif /* WITH_LED */
 	server.on("/temperature", onTemperature);
+#ifdef USE_DTH
 	server.on("/humidity", onHumidity);
+#endif /* USE_DTH */
 #ifdef WITH_SERIAL
 	server.on("/trace", []() { doTrace = !doTrace; server.send(200, "text/play", "ok"); });
 #endif /* WITH_SERIAL */
 	server.on("/sensor", onSensor);
 	server.onNotFound(handleNotFound);
 	server.begin();
-	TRACE_LINE("Server started\n");
+	TRACE_LINE("WEB Server started\n");
 
 	Udp.begin(localPort);
 	TRACE("waiting for time sync, port %u\n", Udp.localPort());
 	setSyncProvider(getNtpTime);
 
 #ifdef CLIENT
-	client_connected = client.connect(weather_server, weather_port);
+	client.connect(weather_server, weather_port);
 #endif /* CLIENT */
 	ledOFF();
+	TRACE("%s fin at %lu\n", __func__, millis());
 }
 
 void loop()
@@ -687,24 +874,33 @@ void loop()
 	if (client.connected())
 	{  // await the data answer
 		while (client.available()) { char c = client.read(); TRACE("%c", c); }
-	} else if (client_connected) {
+	} else {
 		client.stop();
-		client_connected = false;
-		TRACE("%s client conenction closed\n", __func__);
 	}
 #endif /* CLIENT */
 
 	if (millis() >= data_next)
 	{ // sensor time
+#ifdef USE_DS18B20
+		if (!requested) { requested = true; DS18B20.requestTemperatures(); }
+#endif
 		if (sensorRead())
 		{
 			data_next = (data_overrun * interval_sec * data_max + (data_index + 1) * interval_sec) * 1000;
 			TRACE("%s: now:%lu next sensor read %lu\n", __func__, millis(), data_next);
 			return;
 		} else {
+#ifdef USE_DTH
 			data_next = millis() + 4000;
+#endif
+#ifdef USE_DS18B20
+			data_next = millis() + 5;
+#endif
 		}
-	} 
+	}
 	ledOFF();
+#ifndef LIGHT_SLEEP
+	deep_sleep();
+#endif
 }
 
