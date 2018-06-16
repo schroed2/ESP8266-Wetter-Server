@@ -14,7 +14,7 @@
 #define CLIENT        /**< additional data transmittion as for wetter_sensor */
 #define WITH_OTA      /**< Integrate over the air update */
 #define VERSION "0.9" /**< Version */ 
-#define BUILD 12      /**< Build number */ 
+#define BUILD 15      /**< Build number */ 
 #define LOCATION "Wetterstation"
 #define DHT_PIN D2
 ADC_MODE(ADC_VCC)     /**< vcc read */
@@ -108,7 +108,8 @@ static unsigned long reconnect_timeout;  /**< Reconnect timeout within loop() fo
 
 #ifdef CLIENT
 static WiFiClient client;
-static boolean client_connected;
+static unsigned long client_timeout;
+static unsigned long client_error;
 #endif /* CLIENT */
 
 // Sensor object
@@ -158,12 +159,7 @@ static void deep_sleep()
 /** Transmit a message to a server */
 static void transmit_msg(float temperature, float humidity)
 {
-	if (0 == client.connected())
-	{
-		TRACE("connecting to http://%s:%u\n", weather_server, weather_port);
-		client_connected = client.connect(weather_server, weather_port);
-	}
-	if (client.connected())
+	if (client.connect(weather_server, weather_port))
 	{
 		unsigned jlen = snprintf(buf, sizeof(buf), 
 				"{\"sender_id\":\"%s\",\"password\":\"" DB_SECRET "\",\"temperature\":%.1f,\"humidity\":%.1f,\"vcc\":%.2f}\r\n",
@@ -177,8 +173,19 @@ static void transmit_msg(float temperature, float humidity)
 		TRACE_LINE(header);
 		TRACE_LINE(buf);
 		client.write(header, hlen); client.write(buf, jlen);
+		client_timeout = millis() + 3000;  // expect answer fin after 3 sec
+		client_error = 0;
 	} else {
 		TRACE("%s: no http server connection\n", __func__);
+		wifi_trace(WiFi.status());
+		client_error += 1;
+		TRACE("%s client connection errors:%u now:%lu\n", __func__, client_error, millis());
+		if (client_error > 3)
+		{
+			TRACE("%s client connection errors:%u - force WiFi shutdown\n", __func__, client_error);
+			WiFi.mode(WIFI_OFF);
+			if (client_error > 10) { ESP.reset(); }
+		}
 	}
 }
 
@@ -612,9 +619,6 @@ void setup()
 	TRACE("waiting for time sync, port %u\n", Udp.localPort());
 	setSyncProvider(getNtpTime);
 
-#ifdef CLIENT
-	client_connected = client.connect(weather_server, weather_port);
-#endif /* CLIENT */
 	ledOFF();
 }
 
@@ -636,7 +640,7 @@ void loop()
 					break;
 				case WL_DISCONNECTED:
 					ledON();
-					TRACE("%s: WiFi disconnected, connect again", __func__);
+					TRACE("%s: WiFi disconnected, connect again\n", __func__);
 					WiFi.disconnect(false);
 					WiFi.mode(WIFI_STA);
 					WiFi.begin(ssid, password);
@@ -648,10 +652,12 @@ void loop()
 					WiFi.reconnect();
 					reconnect_timeout = millis() + 5000;
 					break;
+				case WL_IDLE_STATUS:
+					reconnect_timeout = millis() + 5000;
+					break;
 				default:
 					reconnect_timeout = 0;
 					WiFi.disconnect(true);
-					data_next += interval_sec;
 					ledOFF();
 					break;
 			}
@@ -684,13 +690,23 @@ void loop()
 #endif /* WITH_OTA */
 
 #ifdef CLIENT
-	if (client.connected())
-	{  // await the data answer
-		while (client.available()) { char c = client.read(); TRACE("%c", c); }
-	} else if (client_connected) {
-		client.stop();
-		client_connected = false;
-		TRACE("%s client conenction closed\n", __func__);
+	if (client_timeout)
+	{
+		if (client.connected())
+		{  // await the data answer
+			while (client.available()) { char c = client.read(); TRACE("%c", c); }
+			if (client_timeout < millis())
+			{
+				client_timeout = 0;
+				client.stop();
+				TRACE("%s client connection closed (timeout at %lu)\n", __func__, millis);
+			}
+		} else {
+				TRACE("%s client connection finished at %lu\n", __func__, millis());
+				client_timeout = 0;
+				client.stop();
+		}
+		return;
 	}
 #endif /* CLIENT */
 
@@ -698,7 +714,11 @@ void loop()
 	{ // sensor time
 		if (sensorRead())
 		{
+#ifdef CLIENT
+			data_next = client_error ? (millis() + 10000) : ((data_overrun * interval_sec * data_max + (data_index + 1) * interval_sec) * 1000);
+#else
 			data_next = (data_overrun * interval_sec * data_max + (data_index + 1) * interval_sec) * 1000;
+#endif
 			TRACE("%s: now:%lu next sensor read %lu\n", __func__, millis(), data_next);
 			return;
 		} else {

@@ -1,3 +1,5 @@
 # exclude editor backup files
 *~
+*.swp
+auth.h
 

@@ -71,7 +71,7 @@ echo
 	{
 		$t = date_create($row['datum']);
 		$i = 24 * 60 - intval(($endTime->format("U") - $t->format("U")) / 60);
-		if ($i < 0) { continue; }
+		if ($i < 0 || ($row['humidity'] < 0)) { continue; }
 		if ($startet && ($last + 5 < $i))
 		{
 			echo '" style="fill:none;stroke:DarkGreen;stroke-width:2" />';

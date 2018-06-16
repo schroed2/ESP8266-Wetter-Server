@@ -33,7 +33,15 @@ $sql = "SELECT datum, temp, humidity FROM temperature WHERE sender_id = 'Ralfs T
 	foreach ($pdo->query($sql) as $row) {
 		echo "Letzte Messung: ".$row['datum']." Temperatur ".$row['temp']."&deg;C Luftfeuchtigkeit ".$row['humidity'];
 	}
-?>
+echo '
 <embed src="graph.php?sensor=Ralfs%20Testsensor" type="image/svg+xml" width="98%" height="500">
+
+<h1>Testsensor2</h1>';
+$sql = "SELECT datum, temp, humidity FROM temperature WHERE sender_id = 'Ralfs Testsensor2' ORDER BY datum DESC LIMIT 1";
+	foreach ($pdo->query($sql) as $row) {
+		echo "Letzte Messung: ".$row['datum']." Temperatur ".$row['temp']."&deg;C Luftfeuchtigkeit ".$row['humidity'];
+	}
+?>
+<embed src="graph.php?sensor=Ralfs%20Testsensor2" type="image/svg+xml" width="98%" height="500">
 </body>
 </html>
