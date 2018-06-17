@@ -15,7 +15,7 @@
 #define WEBSERVER     /**< active web server scripts */
 #undef WITH_OTA      /**< Integrate over the air update (not on S0) */
 #define VERSION "0.9" /**< Version */ 
-#define BUILD 14       /**< Build number */ 
+#define BUILD 15       /**< Build number */ 
 #undef USE_DTH        /**< DTH sensor used */
 #define USE_DS18B20   /**< DS18B20 sensor used */
 #define LOCATION "Testsensor2"
@@ -34,6 +34,8 @@ ADC_MODE(ADC_VCC)     /**< vcc read */
 #define DB_SECRET "geheim"
 #endif
 
+#include <ESP8266WiFi.h>
+
 static const char* ssid = WLAN_SSID;
 static const char* password = WLAN_PASSWORD;
 static const int interval_sec = 60;  // >= 2
@@ -43,12 +45,11 @@ static const int sensors_max = 2;  // max supported sensors
 static const char* sensor_id = "Ralfs " LOCATION; //< ID for data base separation, could be the sensor location name */
 
 #ifdef CLIENT
-static const char* weather_server = "192.168.178.31";
+static IPAddress weather_server(192,168,178,31);
 static const int weather_port = 80;
 #endif /* CLIENT */
 
 
-#include <ESP8266WiFi.h>
 #ifdef USE_DTH
 #include <DHT.h>
 #endif /* USE_DTH */
@@ -165,8 +166,13 @@ static void deep_sleep()
 	unsigned long now = millis();
 	unsigned long wait = data_next - now;
 #ifdef LIGHT_SLEEP
-	if (wait > 2000) { wait = 2000; }
-	TRACE("sleeping %lu msec at: %lu\n", wait, now);
+	static unsigned long next = data_next;
+	if (next != data_next)
+	{
+		TRACE("sleeping %lu msec at: %lu\n", wait, now);
+		next = data_next;
+	}
+	if (wait > 500) { wait = 500; }
 	delay(wait);
 #else
 #ifdef WITH_SERIAL
@@ -194,10 +200,10 @@ static void transmit_msg(float temperature, float humidity)
 		char* header = buf + jlen + 1;
 		unsigned hlen = snprintf(header, sizeof(buf)-jlen-1,
 				"POST /sensor.php HTTP/1.1\r\n"
-				"Host: %s:%u\r\n"
+				"Host: %u.%u.%u.%u:%u\r\n"
 				"Connection: close\r\n"
 				"Content-Type: application/json; charset=utf-8\r\n"
-				"Content-Length: %u\r\n\r\n", weather_server, weather_port, jlen);
+				"Content-Length: %u\r\n\r\n", weather_server[0], weather_server[1], weather_server[2], weather_server[3], weather_port, jlen);
 		TRACE_LINE(header);
 		TRACE_LINE(buf);
 		client.write(header, hlen); client.write(buf, jlen);
@@ -225,12 +231,12 @@ static bool sensorRead()
 	bool ret = true;
 	ledON();
 
+#ifdef USE_DTH
 	if (++data_index >= data_max) {
 		data_index = 0;
 		data_overrun++;
 	}
 	data[0][data_index].temp = -1000;
-#ifdef USE_DTH
 	float t = dht.readTemperature();
 	float h = dht.readHumidity();
 	if (!isnan(t) && !isnan(h))
@@ -257,7 +263,12 @@ static bool sensorRead()
 	if (!DS18B20.isConversionComplete()) 
 	{ 
 		ret = false;
-   	} else {
+	} else {
+		if (++data_index >= data_max) {
+			data_index = 0;
+			data_overrun++;
+		}
+		requested = false;
 		for(i = 0; i < numberOfDevices; i++)
 		{
 			t[i] = DS18B20.getTempC(devAddr[i]);
@@ -677,10 +688,12 @@ static void setupWiFi()
 	TRACE("Connecting to %s", ssid);
 	WiFi.persistent(false);
 	WiFi.mode(WIFI_STA);
+#if 0
 	IPAddress ip(192,168,178,38);
 	IPAddress gw(192,168,178,1);
 	IPAddress mask(255,255,255,0);
 	WiFi.config(ip, gw, mask);
+#endif
 	WiFi.begin(ssid, password);
 
 	if (WiFi.getAutoConnect()) { WiFi.setAutoConnect(false); }
@@ -733,7 +746,6 @@ void setup()
 #ifdef USE_DS18B20
 	setupDS18B20();
 	data_next = millis();
-	requested = true;
 #endif /* USE_DS18B20 */
 
 	// Connect to WiFi network
@@ -938,8 +950,6 @@ void loop()
 		}
 	}
 	ledOFF();
-#ifndef LIGHT_SLEEP
 	deep_sleep();
-#endif
 }
 
