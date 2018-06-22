@@ -15,7 +15,7 @@
 #define WEBSERVER     /**< active web server scripts */
 #undef WITH_OTA      /**< Integrate over the air update (not on S0) */
 #define VERSION "0.9" /**< Version */ 
-#define BUILD 15       /**< Build number */ 
+#define BUILD 16       /**< Build number */ 
 #undef USE_DTH        /**< DTH sensor used */
 #define USE_DS18B20   /**< DS18B20 sensor used */
 #define LOCATION "Testsensor2"
@@ -857,7 +857,7 @@ void loop()
 					TRACE("%s: WiFi disconnected, connect again\n", __func__);
 					WiFi.disconnect(false);
 					setupWiFi();
-					reconnect_timeout = millis() + 5000;
+					reconnect_timeout = millis() + 10000;
 					break;
 				case WL_CONNECTION_LOST:
 					ledON();
@@ -876,7 +876,9 @@ void loop()
 			}
 			delay(100);
 		} else if (reconnect_timeout < millis()) {
-			TRACE("\n%s: no WLAN connection at %ku, status: ", __func__, millis());
+			time_t t = now();
+			t += timeZone_de(t);
+			TRACE("\n%s: no WLAN connection at %lu %u:%u:%u %u-%u-%u, status: ", __func__, millis(), hour(t), minute(t), second(t), day(t), month(t), year(t));
 			wifi_trace(WiFi.status());
 			WiFi.mode(WIFI_OFF);
 			WiFi.forceSleepBegin();
@@ -892,7 +894,7 @@ void loop()
 	}
 	if (reconnect_timeout)
 	{
-		TRACE("\nWiFi reconnected with %s\n", WiFi.localIP().toString().c_str());
+		TRACE("%s WiFI connected on %s channel%u, IP: %s\n", __func__, WiFi.SSID().c_str(), WiFi.channel(), WiFi.localIP().toString().c_str());
 		reconnect_timeout = 0;
 		ledOFF();
 	}
