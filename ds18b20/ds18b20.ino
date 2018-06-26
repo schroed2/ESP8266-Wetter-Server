@@ -15,7 +15,7 @@
 #define WEBSERVER     /**< active web server scripts */
 #undef WITH_OTA      /**< Integrate over the air update (not on S0) */
 #define VERSION "0.9" /**< Version */ 
-#define BUILD 16       /**< Build number */ 
+#define BUILD 16      /**< Build number */ 
 #undef USE_DTH        /**< DTH sensor used */
 #define USE_DS18B20   /**< DS18B20 sensor used */
 #define LOCATION "Testsensor2"
@@ -736,14 +736,8 @@ void setup()
 		 ESP.getSketchSize(), ESP.getFreeSketchSpace(), ESP.getVcc());
 #endif /* WITH_SERIAL */
 
-#ifdef USE_DTH
-	/** Start early because we have to wait 1.5sec before first reading */
-	pinMode(D0, OUTPUT);
-	digitalWrite(D0, HIGH);
-	dht.begin();
-	data_next = millis() + 2000;
-#endif /* USE_DTH */
 #ifdef USE_DS18B20
+	/** Start early because we have to wait 1.5sec before first reading */
 	setupDS18B20();
 	data_next = millis();
 #endif /* USE_DS18B20 */
@@ -785,7 +779,7 @@ void setup()
 #endif /* WITH_SERIAL */
 	ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) 
 	{ 
-		TRACE("Progress: %u%%\r", (progress / (total / 100))); 
+		TRACE("Progress: %u%%\n", (progress / (total / 100))); 
 #ifdef WITH_LED
 		static boolean led = true;
 		if (led) { ledON(); } else { ledOFF(); }
@@ -804,6 +798,15 @@ void setup()
 #endif /* WITH_SERIAL */
 	ArduinoOTA.begin();
 #endif /* WITH_OTA */
+
+#ifdef USE_DTH
+#ifdef DHT_VCC_PIN
+	pinMode(DHT_VCC_PIN, OUTPUT);
+	digitalWrite(DHT_VCC_PIN, HIGH);
+#endif /* DHT_VCC_PIN */
+	dht.begin();
+	data_next = millis() + 2000;
+#endif /* USE_DTH */
 
 #ifdef WEBSERVER
 	// Start the server
