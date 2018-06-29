@@ -15,7 +15,7 @@
 #define WEBSERVER     /**< active web server scripts */
 #undef WITH_OTA      /**< Integrate over the air update (not on S0) */
 #define VERSION "0.9" /**< Version */ 
-#define BUILD 16      /**< Build number */ 
+#define BUILD 18      /**< Build number */ 
 #undef USE_DTH        /**< DTH sensor used */
 #define USE_DS18B20   /**< DS18B20 sensor used */
 #define LOCATION "Testsensor2"
@@ -167,7 +167,7 @@ static void deep_sleep()
 	unsigned long wait = data_next - now;
 #ifdef LIGHT_SLEEP
 	static unsigned long next = data_next;
-	if (next != data_next)
+	if (next != data_next && wait > 1000)
 	{
 		TRACE("sleeping %lu msec at: %lu\n", wait, now);
 		next = data_next;
@@ -212,13 +212,18 @@ static void transmit_msg(float temperature, float humidity)
 	} else {
 		TRACE("%s: no http server connection\n", __func__);
 		wifi_trace(WiFi.status());
-		client_error += 1;
-		TRACE("%s client connection errors:%u now:%lu\n", __func__, client_error, millis());
-		if (client_error > 3)
+		switch (client_error++)
 		{
-			TRACE("%s client connection errors:%u - force WiFi shutdown\n", __func__, client_error);
-			WiFi.mode(WIFI_OFF);
-			if (client_error > 10) { ESP.reset(); }
+			case 7:
+				TRACE("%s client connection errors:%u - force WiFi shutdown\n", __func__, client_error);
+				WiFi.mode(WIFI_OFF);
+				break;
+			case 10:
+				TRACE("%s client connection errors:%u - force ESP reset\n", __func__, client_error);
+				ESP.reset();
+				break;
+			default:
+				TRACE("%s client connection errors:%u now:%lu\n", __func__, client_error, millis());
 		}
 	}
 }
@@ -237,6 +242,7 @@ static bool sensorRead()
 		data_overrun++;
 	}
 	data[0][data_index].temp = -1000;
+
 	float t = dht.readTemperature();
 	float h = dht.readHumidity();
 	if (!isnan(t) && !isnan(h))
@@ -250,10 +256,12 @@ static bool sensorRead()
 				data_overrun, data_index, data[0][data_index].temp / 10, data[0][data_index].temp % 10, data[0][data_index].hum / 10, data[0][data_index].hum % 10,
 				WiFi.RSSI());
 	} else {
-		digitalWrite(D0, LOW);
 		TRACE("%s: reading sensor failed, try again\n", __func__);
+#ifdef DHT_VCC_PIN
+		digitalWrite(DHT_VCC_PIN, LOW);
 		delay(20);
-		digitalWrite(D0, HIGH);
+		digitalWrite(DHT_VCC_PIN, HIGH);
+#endif /* DHT_VCC_PIN */
 		ret = false;
 	}
 #endif /* USE_DTH */
@@ -685,19 +693,24 @@ static void setupDS18B20()
 
 static void setupWiFi()
 {
-	TRACE("Connecting to %s", ssid);
 	WiFi.persistent(false);
-	WiFi.mode(WIFI_STA);
+	if (WiFi.mode(WIFI_STA))
+	{
+		TRACE("%s: Connecting to %s", __func__, ssid);
 #if 0
-	IPAddress ip(192,168,178,38);
-	IPAddress gw(192,168,178,1);
-	IPAddress mask(255,255,255,0);
-	WiFi.config(ip, gw, mask);
+		IPAddress ip(192,168,178,38);
+		IPAddress gw(192,168,178,1);
+		IPAddress mask(255,255,255,0);
+		WiFi.config(ip, gw, mask);
 #endif
-	WiFi.begin(ssid, password);
+		WiFi.begin(ssid, password);
 
-	if (WiFi.getAutoConnect()) { WiFi.setAutoConnect(false); }
-	WiFi.setAutoReconnect(true);
+		if (WiFi.getAutoConnect()) { WiFi.setAutoConnect(false); }
+		WiFi.setAutoReconnect(true);
+	} else {
+		TRACE("%s: WiFi no in station mode (FATAL)", __func__);
+		ESP.reset();
+	}
 }
 
 
@@ -743,16 +756,6 @@ void setup()
 #endif /* USE_DS18B20 */
 
 	// Connect to WiFi network
-#ifdef WITH_SERIAL
-	WiFi.onStationModeConnected([](const WiFiEventStationModeConnected& event)
-			{ TRACE("%s WiFI connected on %s channel%u, IP: %s\n", __func__, WiFi.SSID().c_str(), WiFi.channel(), WiFi.localIP().toString().c_str()); }
-		);
-
-	WiFi.onStationModeDisconnected([](const WiFiEventStationModeDisconnected& event)
-			{ TRACE("%s Station disconnected from %s, reason %d\n", __func__, event.ssid.c_str(), event.reason ); }
-		);
-#endif /* WITH_SERIAL */
-
 	setupWiFi();
 	for(int count = 0; count < 100; count++)
 	{
@@ -840,6 +843,7 @@ void setup()
 
 void loop()
 {
+	static int wifi_retry_count = 0;
 #ifdef WITH_LED
 	if (ledFlash <= millis()) { ledON(); ledFlash += 5000; }
 #endif /* WITH_LED */
@@ -849,8 +853,10 @@ void loop()
 	{
 		if (!reconnect_timeout)
 		{
-			TRACE("%s: WiFi problem detectd at %lu, status: ", __func__, millis());
-			wifi_trace(WiFi.status());
+			TRACE("%s: WiFi disconnected, await reconnection on state ", __func__); wifi_trace(WiFi.status());
+			reconnect_timeout = millis() + 5000;
+		} else if (reconnect_timeout < millis()) {
+			TRACE("%s: WiFi no WLAN connection (retry %u) on state ", __func__, wifi_retry_count); wifi_trace(WiFi.status());
 			switch(WiFi.status())
 			{
 				case WL_CONNECTED:
@@ -858,37 +864,34 @@ void loop()
 				case WL_DISCONNECTED:
 					ledON();
 					TRACE("%s: WiFi disconnected, connect again\n", __func__);
-					WiFi.disconnect(false);
-					setupWiFi();
+					WiFi.mode(WIFI_STA);
+					WiFi.begin(ssid, password);
 					reconnect_timeout = millis() + 10000;
 					break;
 				case WL_CONNECTION_LOST:
 					ledON();
 					TRACE("%s: WiFi connection lost, restart", __func__);
 					WiFi.reconnect();
-					reconnect_timeout = millis() + 5000;
+					reconnect_timeout = millis() + 10000;
 					break;
 				case WL_IDLE_STATUS:
-					reconnect_timeout = millis() + 5000;
+					reconnect_timeout = millis() + 10000;
 					break;
 				default:
 					reconnect_timeout = 0;
 					WiFi.disconnect(true);
 					ledOFF();
+					data_next += interval_sec;
+					deep_sleep(); // give up, wait one data interval
 					break;
 			}
 			delay(100);
-		} else if (reconnect_timeout < millis()) {
-			time_t t = now();
-			t += timeZone_de(t);
-			TRACE("\n%s: no WLAN connection at %lu %u:%u:%u %u-%u-%u, status: ", __func__, millis(), hour(t), minute(t), second(t), day(t), month(t), year(t));
 			wifi_trace(WiFi.status());
-			WiFi.mode(WIFI_OFF);
-			WiFi.forceSleepBegin();
-			reconnect_timeout = 0;
-			data_next += interval_sec;
-			ledOFF();
-			deep_sleep(); // give up, wait one data interval
+			if (wifi_retry_count++ == 5)
+			{
+				TRACE("\n%s: no WLAN connection, retry count %u force reset\n", __func__, wifi_retry_count);
+				ESP.reset();
+			}
 		} else {
 			TRACE(".");
 			delay(100);
@@ -899,6 +902,7 @@ void loop()
 	{
 		TRACE("%s WiFI connected on %s channel%u, IP: %s\n", __func__, WiFi.SSID().c_str(), WiFi.channel(), WiFi.localIP().toString().c_str());
 		reconnect_timeout = 0;
+		wifi_retry_count = 0;
 		ledOFF();
 	}
 	// we are connected with WiFi here
@@ -950,7 +954,8 @@ void loop()
 			data_next = millis() + 4000;
 #endif
 #ifdef USE_DS18B20
-			data_next = millis() + 5;
+			data_next = millis() + 10;
+
 #endif
 		}
 	}

@@ -15,8 +15,8 @@
 #define WEBSERVER     /**< active web server scripts */
 #define WITH_OTA      /**< Integrate over the air update */
 #define VERSION "0.9" /**< Version */ 
-#define BUILD 16      /**< Build number */ 
-#definne USE_DTH      /**< DTH sensor used */
+#define BUILD 18      /**< Build number */ 
+#define USE_DTH      /**< DTH sensor used */
 #undef USE_DS18B20    /**< DS18B20 sensor used */
 #define LOCATION "Wetterstation"
 #define SENSOR_PIN D2    /**< sensor data pin */
@@ -41,7 +41,7 @@ static const char* ssid = WLAN_SSID;
 static const char* password = WLAN_PASSWORD;
 static const int interval_sec = 60;  // >= 2
 static const int data_max = 24 * 3600 / interval_sec;  // 1 day
-static const int sensors_max = 2;  // max supported sensors
+static const int sensors_max = 1;  // max supported sensors
 static const char* sensor_id = "Ralfs " LOCATION; //< ID for data base separation, could be the sensor location name */
 
 #ifdef CLIENT
@@ -53,6 +53,10 @@ static const int weather_port = 80;
 #ifdef USE_DTH
 #include <DHT.h>
 #endif /* USE_DTH */
+#ifdef USE_DS18B20
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#endif /* USE_DS18B20 */
 
 #ifdef WEBSERVER
 #include <TimeLib.h> 
@@ -127,6 +131,13 @@ static unsigned long client_error;
 #ifdef USE_DTH
 static DHT dht(SENSOR_PIN, DHT22);
 #endif /* USE_DTH */
+#ifdef USE_DS18B20
+static OneWire oneWire(SENSOR_PIN);
+static DallasTemperature DS18B20(&oneWire);
+static uint8_t numberOfDevices;              /** connected temperature devices */
+static DeviceAddress devAddr[sensors_max];
+static boolean requested;
+#endif /* USE_DS18B20 */
 static unsigned long data_next;          /**< time to read the sensor (millis value) */
 
 
@@ -156,7 +167,7 @@ static void deep_sleep()
 	unsigned long wait = data_next - now;
 #ifdef LIGHT_SLEEP
 	static unsigned long next = data_next;
-	if (next != data_next)
+	if (next != data_next && wait > 1000)
 	{
 		TRACE("sleeping %lu msec at: %lu\n", wait, now);
 		next = data_next;
@@ -222,7 +233,7 @@ static void transmit_msg(float temperature, float humidity)
 
 static bool sensorRead()
 {
-	bool ret;
+	bool ret = true;
 	ledON();
 
 #ifdef USE_DTH
@@ -244,7 +255,6 @@ static bool sensorRead()
 		TRACE("Index:%d/%d Temperatur: %d.%d°C Luftfeuchtikeit: %d.%d%% RSSI:%d\n",
 				data_overrun, data_index, data[0][data_index].temp / 10, data[0][data_index].temp % 10, data[0][data_index].hum / 10, data[0][data_index].hum % 10,
 				WiFi.RSSI());
-		ret = true;
 	} else {
 		TRACE("%s: reading sensor failed, try again\n", __func__);
 #ifdef DHT_VCC_PIN
@@ -255,6 +265,30 @@ static bool sensorRead()
 		ret = false;
 	}
 #endif /* USE_DTH */
+#ifdef USE_DS18B20
+	int i;
+	float t[numberOfDevices];
+	if (!DS18B20.isConversionComplete()) 
+	{ 
+		ret = false;
+	} else {
+		if (++data_index >= data_max) {
+			data_index = 0;
+			data_overrun++;
+		}
+		requested = false;
+		for(i = 0; i < numberOfDevices; i++)
+		{
+			t[i] = DS18B20.getTempC(devAddr[i]);
+			data[i][data_index].temp = (int)(t[i] * 10 + 0.5);
+			TRACE("Sensor %d Index:%d/%d Temperatur: %d.%d°C RSSI:%d\n",
+					i+1, data_overrun, data_index, data[i][data_index].temp / 10, data[i][data_index].temp % 10, WiFi.RSSI());
+		}
+#ifdef CLIENT
+		transmit_msg(t[0], -1);
+#endif /* CLIENT */
+	}
+#endif /* USE_DS18B20 */
 
 	ledOFF();
 	return ret;
@@ -615,8 +649,77 @@ static int wifi_trace(int status)
 #define wifi_trace(status) status
 #endif
 
+
+
+#ifdef USE_DS18B20
+//Setting the temperature sensor
+static void setupDS18B20()
+{
+	DS18B20.begin();
+	uint8_t devs = DS18B20.getDeviceCount();
+	numberOfDevices = DS18B20.getDS18Count();
+	TRACE("%s: device count: %u/%u/%u parasite power is: %s\n", __func__, numberOfDevices, devs, sensors_max, (DS18B20.isParasitePowerMode() ? "ON" : "OFF"));
+	if (numberOfDevices > sensors_max) { numberOfDevices = sensors_max; }
+
+	data_next = millis() + 2000;
+	DS18B20.setWaitForConversion(true);
+	DS18B20.requestTemperatures();
+
+	// Loop through each device, print out address
+	for(int i=0, d=0; d < devs; d++)
+	{
+		DeviceAddress addr;
+		// Search the wire for address
+		if (DS18B20.getAddress(addr, d))
+		{
+			if (DS18B20.validFamily(addr) && (i < sensors_max) && DS18B20.getAddress(devAddr[i], d))
+			{
+				i++;
+				TRACE("%s: found device %d/%d with address: %02X %02X %02X %02X %02X %02X %02X %02X resolution: %d temperature: %f°C\n",
+					   	__func__, i, d,
+						addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], addr[6], addr[7],
+						DS18B20.getResolution(addr), DS18B20.getTempC(addr));
+			} else {
+				TRACE("%s: found other device %d with address: %02X %02X %02X %02X %02X %02X %02X %02X\n",
+					   	__func__, d, addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], addr[6], addr[7]);
+			}
+		} else {
+			TRACE("%s: found ghost device at %d/%d but could not detect address. Check power and cabling\n", __func__, i+1, devs);
+		}
+	}
+	DS18B20.setWaitForConversion(false);
+}
+#endif /* USE_DS18B20 */
+
+static void setupWiFi()
+{
+	WiFi.persistent(false);
+	if (WiFi.mode(WIFI_STA))
+	{
+		TRACE("%s: Connecting to %s", __func__, ssid);
+#if 0
+		IPAddress ip(192,168,178,38);
+		IPAddress gw(192,168,178,1);
+		IPAddress mask(255,255,255,0);
+		WiFi.config(ip, gw, mask);
+#endif
+		WiFi.begin(ssid, password);
+
+		if (WiFi.getAutoConnect()) { WiFi.setAutoConnect(false); }
+		WiFi.setAutoReconnect(true);
+	} else {
+		TRACE("%s: WiFi no in station mode (FATAL)", __func__);
+		ESP.reset();
+	}
+}
+
+
 void setup()
 {
+	WiFi.mode(WIFI_OFF);
+	WiFi.forceSleepBegin();
+	delay(1);
+
 #ifdef WITH_LED
 	pinMode(WITH_LED, OUTPUT);
 	ledFlash = millis() + 5000;
@@ -646,22 +749,23 @@ void setup()
 		 ESP.getSketchSize(), ESP.getFreeSketchSpace(), ESP.getVcc());
 #endif /* WITH_SERIAL */
 
+#ifdef USE_DS18B20
+	/** Start early because we have to wait 1.5sec before first reading */
+	setupDS18B20();
+	data_next = millis();
+#endif /* USE_DS18B20 */
+
 	// Connect to WiFi network
-	//WiFi.persistent(false);
-	if (WiFi.mode (WIFI_STA))
+	setupWiFi();
+	for(int count = 0; count < 100; count++)
 	{
-		TRACE("%s: Connecting to %s", __func__, ssid);
-		WiFi.begin(ssid, password);
-		for(int count = 0; count < 100; count++)
-		{
 			if (WiFi.status() == WL_CONNECTED) { break; }
-			delay(100);
+			delay(50);
 			TRACE(".");
-		}
-		wifi_trace(WiFi.status());
-		TRACE("WiFI connected on %s channel%u, IP: %s\n", WiFi.SSID().c_str(), WiFi.channel(), WiFi.localIP().toString().c_str());
-	} else {
-		TRACE("%s: WiFi no in station mode (FATAL)", __func__);
+	}
+	if (WL_CONNECTED == wifi_trace(WiFi.status()))
+	{
+		TRACE("%s WiFI connected on %s channel%u, IP: %s\n", __func__, WiFi.SSID().c_str(), WiFi.channel(), WiFi.localIP().toString().c_str());
 	}
 
 	for(data_index = 0; data_index < data_max; data_index++)
@@ -771,7 +875,7 @@ void loop()
 					reconnect_timeout = millis() + 10000;
 					break;
 				case WL_IDLE_STATUS:
-					reconnect_timeout = millis() +10000;
+					reconnect_timeout = millis() + 10000;
 					break;
 				default:
 					reconnect_timeout = 0;
@@ -796,7 +900,7 @@ void loop()
 	}
 	if (reconnect_timeout)
 	{
-		TRACE("\nWiFi reconnected with %s\n", WiFi.localIP().toString().c_str());
+		TRACE("%s WiFI connected on %s channel%u, IP: %s\n", __func__, WiFi.SSID().c_str(), WiFi.channel(), WiFi.localIP().toString().c_str());
 		reconnect_timeout = 0;
 		wifi_retry_count = 0;
 		ledOFF();
@@ -833,6 +937,9 @@ void loop()
 
 	if (millis() >= data_next)
 	{ // sensor time
+#ifdef USE_DS18B20
+		if (!requested) { requested = true; DS18B20.requestTemperatures(); }
+#endif
 		if (sensorRead())
 		{
 #ifdef CLIENT
@@ -843,7 +950,13 @@ void loop()
 			TRACE("%s: now:%lu next sensor read %lu\n", __func__, millis(), data_next);
 			return;
 		} else {
+#ifdef USE_DTH
 			data_next = millis() + 4000;
+#endif
+#ifdef USE_DS18B20
+			data_next = millis() + 10;
+
+#endif
 		}
 	}
 	ledOFF();
