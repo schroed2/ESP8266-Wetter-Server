@@ -15,13 +15,17 @@
 #define WEBSERVER     /**< active web server scripts */
 #define WITH_OTA      /**< Integrate over the air update */
 #define VERSION "0.9" /**< Version */ 
-#define BUILD 18      /**< Build number */ 
+#define BUILD 36      /**< Build number */ 
 #define USE_DTH      /**< DTH sensor used */
 #undef USE_DS18B20    /**< DS18B20 sensor used */
+#define WITH_ADC        /**< VCC messure */
 #define LOCATION "Wetterstation"
 #define SENSOR_PIN D2    /**< sensor data pin */
-#undef DHT_VCC_PIN    /**< DHT VCC pin if not connected with VCC directly */
+#undef SENSOR_VCC_PIN    /**< DHT VCC pin if not connected with VCC directly */
+
+#ifdef WITH_ADC
 ADC_MODE(ADC_VCC)     /**< vcc read */
+#endif /* WITH_ADC */
 
 #include "auth.h"
 
@@ -45,6 +49,7 @@ static const int sensors_max = 1;  // max supported sensors
 static const char* sensor_id = "Ralfs " LOCATION; //< ID for data base separation, could be the sensor location name */
 
 #ifdef CLIENT
+//static IPAddress weather_server(192,168,178,31);
 static const char* weather_server = "raspi.fritz.box";
 static const int weather_port = 80;
 #endif /* CLIENT */
@@ -105,18 +110,40 @@ class myServer: public ESP8266WebServer
 {
 	public:
 		myServer(int port) : ESP8266WebServer(port) {}
-		virtual ~myServer() {}
 		void prepareHeader(int code, const char* content_type, unsigned content_len) {
 			String header;
 			_prepareHeader(header, code, content_type, content_len);
 			TRACE_LINE(header);
-			_currentClientWrite(header.c_str(), header.length());
+			client().write(header.c_str(), header.length());
 		}
 };
 
 
 
 static myServer server(80);              /**< web server instance */
+
+// sensor data
+static int data_index;
+static int data_overrun = -1;
+
+static struct
+{
+	int temp;
+#ifdef USE_DTH
+	int hum;
+#endif /* USE_DTH */
+} data[sensors_max][data_max];
+
+#else
+static struct
+{
+	int temp;
+#ifdef USE_DTH
+	int hum;
+#endif /* USE_DTH */
+} data[sensors_max][1];
+#define data_index 0
+#define data_overrun 0
 #endif /* WEBSERVER */
 
 static unsigned long reconnect_timeout;  /**< Reconnect timeout within loop() for lost WiFi connections (millis() value) */
@@ -124,7 +151,7 @@ static unsigned long reconnect_timeout;  /**< Reconnect timeout within loop() fo
 #ifdef CLIENT
 static WiFiClient client;
 static unsigned long client_timeout;
-static unsigned long client_error;
+static unsigned client_error;
 #endif /* CLIENT */
 
 // Sensor object
@@ -141,38 +168,30 @@ static boolean requested;
 static unsigned long data_next;          /**< time to read the sensor (millis value) */
 
 
-// sensor data
-static int data_index;
-static int data_overrun = -1;
-
-static struct
-{
-	int temp;
-#ifdef USE_DTH
-	int hum;
-#endif /* USE_DTH */
-} data[sensors_max][data_max];
-
 
 /** Scratch buffer to avoid expensive object management in many situations */
 static char buf[600];
 
+#ifdef LIGHT_SLEEP
+static unsigned long light_sleep_ts;
+static const unsigned long light_sleep_period = 1000;
+#endif /* LIGHT_SLEEP */
 
 /** Deep sleep methon. I assume here, that the function continues after the sleep.
  *  That's not true for reset based variants, but other light sleep varaint can be test so, too.
  */
-static void deep_sleep()
+static void deep_sleep(unsigned wait)
 {
 	unsigned long now = millis();
-	unsigned long wait = data_next - now;
 #ifdef LIGHT_SLEEP
-	static unsigned long next = data_next;
-	if (next != data_next && wait > 1000)
+	if (light_sleep_ts != data_next)
 	{
-		TRACE("sleeping %lu msec at: %lu\n", wait, now);
-		next = data_next;
+		TRACE("sleeping %u msec at: %lu", wait, now);
+		light_sleep_ts = data_next;
+	} else {
+		TRACE(".");
 	}
-	if (wait > 500) { wait = 500; }
+	if (wait > light_sleep_period) { wait = light_sleep_period; }
 	delay(wait);
 #else
 #ifdef WITH_SERIAL
@@ -195,39 +214,52 @@ static void transmit_msg(float temperature, float humidity)
 	if (client.connect(weather_server, weather_port))
 	{
 		unsigned jlen = snprintf(buf, sizeof(buf), 
-				"{\"sender_id\":\"%s\",\"password\":\"" DB_SECRET "\",\"temperature\":%.1f,\"humidity\":%.1f,\"vcc\":%.2f}\r\n",
-				sensor_id, temperature, humidity, ESP.getVcc() / 1000.0);
+				"{\"sender_id\":\"%s\",\"password\":\"" DB_SECRET "\",\"temperature\":%.1f,\"humidity\":%.1f"
+#ifdef WITH_ADC
+				",\"vcc\":%.2f"
+#endif /* WITH_ADC */
+				"}\r\n",
+				sensor_id, temperature, humidity
+#ifdef WITH_ADC
+				, ESP.getVcc() / 1000.0
+#endif /* WITH_ADC */
+				);
 		char* header = buf + jlen + 1;
 		unsigned hlen = snprintf(header, sizeof(buf)-jlen-1,
 				"POST /sensor.php HTTP/1.1\r\n"
+				//"Host: %u.%u.%u.%u:%u\r\n"
 				"Host: %s:%u\r\n"
 				"Connection: close\r\n"
 				"Content-Type: application/json; charset=utf-8\r\n"
-				"Content-Length: %u\r\n\r\n", weather_server, weather_port, jlen);
+				"Content-Length: %u\r\n\r\n",
+				//weather_server[0], weather_server[1], weather_server[2], weather_server[3], weather_port, jlen);
+				weather_server, weather_port, jlen);
 		TRACE_LINE(header);
 		TRACE_LINE(buf);
 		client.write(header, hlen); client.write(buf, jlen);
 		client_timeout = millis() + 3000;  // expect answer fin after 3 sec
-		client_error = 0;
 	} else {
 		TRACE("%s: no http server connection\n", __func__);
 		wifi_trace(WiFi.status());
-		switch (client_error++)
-		{
-			case 7:
-				TRACE("%s client connection errors:%u - force WiFi shutdown\n", __func__, client_error);
-				WiFi.mode(WIFI_OFF);
-				break;
-			case 10:
-				TRACE("%s client connection errors:%u - force ESP reset\n", __func__, client_error);
-				ESP.reset();
-				break;
-			default:
-				TRACE("%s client connection errors:%u now:%lu\n", __func__, client_error, millis());
-		}
+		client_error++;
+	}
+	switch (client_error)
+	{
+		case 0: break;
+		case 3:
+		TRACE("%s client connection errors:%u - force WiFi shutdown\n", __func__, client_error);
+		if (client.connected()) { client.stop(); client_timeout = 0; }
+		WiFi.mode(WIFI_OFF);
+		delay(5000);
+		break;
+		case 7:
+		TRACE("%s client connection errors:%u - force ESP reset\n", __func__, client_error);
+		ESP.reset();
+		break;
+		default:
+		TRACE("%s client connection errors:%u now:%lu\n", __func__, client_error, millis());
 	}
 }
-
 #endif /* CLIENT */
 
 
@@ -237,10 +269,12 @@ static bool sensorRead()
 	ledON();
 
 #ifdef USE_DTH
+#ifdef WEBSERVER
 	if (++data_index >= data_max) {
 		data_index = 0;
 		data_overrun++;
 	}
+#endif /* WEBSERVER */
 	data[0][data_index].temp = -1000;
 
 	float t = dht.readTemperature();
@@ -257,25 +291,33 @@ static bool sensorRead()
 				WiFi.RSSI());
 	} else {
 		TRACE("%s: reading sensor failed, try again\n", __func__);
-#ifdef DHT_VCC_PIN
-		digitalWrite(DHT_VCC_PIN, LOW);
+#ifdef SENSOR_VCC_PIN
+		digitalWrite(SENSOR_VCC_PIN, LOW);
 		delay(20);
-		digitalWrite(DHT_VCC_PIN, HIGH);
-#endif /* DHT_VCC_PIN */
+		digitalWrite(SENSOR_VCC_PIN, HIGH);
+#endif /* SENSOR_VCC_PIN */
 		ret = false;
 	}
 #endif /* USE_DTH */
 #ifdef USE_DS18B20
 	int i;
 	float t[numberOfDevices];
+	if (!requested)
+	{ 
+			TRACE("%s: sensor data request at %lu\n", __func__, millis());
+			requested = true;
+			DS18B20.requestTemperatures();
+	}
 	if (!DS18B20.isConversionComplete()) 
 	{ 
 		ret = false;
 	} else {
+#ifdef WEBSERVER
 		if (++data_index >= data_max) {
 			data_index = 0;
 			data_overrun++;
 		}
+#endif /* WEBSERVER */
 		requested = false;
 		for(i = 0; i < numberOfDevices; i++)
 		{
@@ -285,7 +327,7 @@ static bool sensorRead()
 					i+1, data_overrun, data_index, data[i][data_index].temp / 10, data[i][data_index].temp % 10, WiFi.RSSI());
 		}
 #ifdef CLIENT
-		transmit_msg(t[0], -1);
+		if (numberOfDevices) { transmit_msg(t[0], -1); }
 #endif /* CLIENT */
 	}
 #endif /* USE_DS18B20 */
@@ -325,6 +367,9 @@ static void onRoot()
 		int hr = min / 60;
 		time_t t = now();
 		t += timeZone_de(t);
+
+		snprintf(buf, sizeof(buf), "\"%02d:%02d %02u.%02u.%04u\"", hour(t), minute(t), day(t), month(t), year(t));
+		server.sendHeader("ETag", buf, true);
 
 		snprintf(buf, sizeof(buf),
 				"<!DOCTYPE html>"
@@ -636,7 +681,7 @@ static int wifi_trace(int status)
 		case WL_CONNECTED: TRACE_LINE("WiFi: WL_CONNECTED\n"); break;
 		case WL_NO_SHIELD: TRACE_LINE("WiFi: WL_NO_SHIELD\n"); break;
 		case WL_IDLE_STATUS: TRACE_LINE("WiFi: WL_IDLE_STATUS\n"); break;
-		case WL_NO_SSID_AVAIL: TRACE_LINE("WiFi: WL_SSID_AVAIL\n"); break;
+		case WL_NO_SSID_AVAIL: TRACE_LINE("WiFi: WL_NO_SSID_AVAIL\n"); break;
 		case WL_SCAN_COMPLETED: TRACE_LINE("WiFi: WL_SCAN_COMPLETED\n"); break;
 		case WL_CONNECT_FAILED: TRACE_LINE("WiFi: WL_CONNECT_FAILED\n"); break;
 		case WL_CONNECTION_LOST: TRACE_LINE("WiFi: WL_CONNECTION_LOST\n"); break;
@@ -655,6 +700,10 @@ static int wifi_trace(int status)
 //Setting the temperature sensor
 static void setupDS18B20()
 {
+#ifdef SENSOR_VCC_PIN
+	pinMode(SENSOR_VCC_PIN, OUTPUT);
+	digitalWrite(SENSOR_VCC_PIN, HIGH);
+#endif /* SENSOR_VCC_PIN */
 	DS18B20.begin();
 	uint8_t devs = DS18B20.getDeviceCount();
 	numberOfDevices = DS18B20.getDS18Count();
@@ -664,6 +713,7 @@ static void setupDS18B20()
 	data_next = millis() + 2000;
 	DS18B20.setWaitForConversion(true);
 	DS18B20.requestTemperatures();
+	requested = true;
 
 	// Loop through each device, print out address
 	for(int i=0, d=0; d < devs; d++)
@@ -693,7 +743,7 @@ static void setupDS18B20()
 
 static void setupWiFi()
 {
-	WiFi.persistent(false);
+	//WiFi.persistent(false);
 	if (WiFi.mode(WIFI_STA))
 	{
 		TRACE("%s: Connecting to %s", __func__, ssid);
@@ -705,7 +755,7 @@ static void setupWiFi()
 #endif
 		WiFi.begin(ssid, password);
 
-		if (WiFi.getAutoConnect()) { WiFi.setAutoConnect(false); }
+		//if (WiFi.getAutoConnect()) { WiFi.setAutoConnect(false); }
 		WiFi.setAutoReconnect(true);
 	} else {
 		TRACE("%s: WiFi no in station mode (FATAL)", __func__);
@@ -716,9 +766,11 @@ static void setupWiFi()
 
 void setup()
 {
+#if 0
 	WiFi.mode(WIFI_OFF);
 	WiFi.forceSleepBegin();
 	delay(1);
+#endif
 
 #ifdef WITH_LED
 	pinMode(WITH_LED, OUTPUT);
@@ -728,6 +780,7 @@ void setup()
 
 #ifdef WITH_SERIAL
 	Serial.begin(115200);
+	//Serial.setDebugOutput(true);
 	delay(30);
 	enum flash_size_map fmap = system_get_flash_size_map();
 	const char * const FLASH_MAP[] = {
@@ -741,12 +794,20 @@ void setup()
 		"32Mbits. Map : 2048KBytes + 2048KBytes",
 		"64Mbits. Map : 1024KBytes + 1024KBytes",
 		"128Mbits. Map : 1024KBytes + 1024KBytes"
-		};
+	};
 
-	TRACE("\n-------------------\n%s reset reason: %s flash: %s size: %u real %u speed %u freq %uMHz scetch %u free %u Vcc: %d\n",
+	TRACE("\n-------------------\n%s reset reason: %s flash: %s size: %u real %u speed %u freq %uMHz scetch %u free %u"
+#ifdef WITH_ADC
+			" Vcc: %d"
+#endif /* WITH_ADC */
+			"\n",
 			__func__, ESP.getResetInfo().c_str(), FLASH_MAP[fmap],
-		 ESP.getFlashChipSize(), ESP.getFlashChipRealSize(), ESP.getFlashChipSpeed(), ESP.getCpuFreqMHz(),
-		 ESP.getSketchSize(), ESP.getFreeSketchSpace(), ESP.getVcc());
+			ESP.getFlashChipSize(), ESP.getFlashChipRealSize(), ESP.getFlashChipSpeed(), ESP.getCpuFreqMHz(),
+			ESP.getSketchSize(), ESP.getFreeSketchSpace()
+#ifdef WITH_ADC
+			, ESP.getVcc()
+#endif /* WITH_ADC */
+		 );
 #endif /* WITH_SERIAL */
 
 #ifdef USE_DS18B20
@@ -759,20 +820,22 @@ void setup()
 	setupWiFi();
 	for(int count = 0; count < 100; count++)
 	{
-			if (WiFi.status() == WL_CONNECTED) { break; }
-			delay(50);
-			TRACE(".");
+		if (WiFi.status() == WL_CONNECTED) { break; }
+		delay(50);
+		TRACE(".");
 	}
 	if (WL_CONNECTED == wifi_trace(WiFi.status()))
 	{
 		TRACE("%s WiFI connected on %s channel%u, IP: %s\n", __func__, WiFi.SSID().c_str(), WiFi.channel(), WiFi.localIP().toString().c_str());
 	}
 
+#ifdef WEBSERVER
 	for(data_index = 0; data_index < data_max; data_index++)
 	{ 
 		for(int i = 0; i < sensors_max; i++) { data[i][data_index].temp = -1000; } 
 	}
 	data_index = data_max - 1;
+#endif /* WEBSERVER */
 
 #ifdef WITH_OTA
 	ArduinoOTA.setHostname(LOCATION);
@@ -803,10 +866,10 @@ void setup()
 #endif /* WITH_OTA */
 
 #ifdef USE_DTH
-#ifdef DHT_VCC_PIN
-	pinMode(DHT_VCC_PIN, OUTPUT);
-	digitalWrite(DHT_VCC_PIN, HIGH);
-#endif /* DHT_VCC_PIN */
+#ifdef SENSOR_VCC_PIN
+	pinMode(SENSOR_VCC_PIN, OUTPUT);
+	digitalWrite(SENSOR_VCC_PIN, HIGH);
+#endif /* SENSOR_VCC_PIN */
 	dht.begin();
 	data_next = millis() + 2000;
 #endif /* USE_DTH */
@@ -825,7 +888,7 @@ void setup()
 	server.on("/humidity", onHumidity);
 #endif /* USE_DTH */
 #ifdef WITH_SERIAL
-	server.on("/trace", []() { doTrace = !doTrace; server.send(200, "text/play", "ok"); });
+	server.on("/trace", []() { doTrace = !doTrace; server.send(200, "text/plain", "ok"); });
 #endif /* WITH_SERIAL */
 	server.on("/sensor", onSensor);
 	server.onNotFound(handleNotFound);
@@ -848,67 +911,13 @@ void loop()
 	if (ledFlash <= millis()) { ledON(); ledFlash += 5000; }
 #endif /* WITH_LED */
 
-	/** Check WiFi connection first */
-	if (WL_CONNECTED != WiFi.status())
-	{
-		if (!reconnect_timeout)
-		{
-			TRACE("%s: WiFi disconnected, await reconnection on state ", __func__); wifi_trace(WiFi.status());
-			reconnect_timeout = millis() + 5000;
-		} else if (reconnect_timeout < millis()) {
-			TRACE("%s: WiFi no WLAN connection (retry %u) on state ", __func__, wifi_retry_count); wifi_trace(WiFi.status());
-			switch(WiFi.status())
-			{
-				case WL_CONNECTED:
-					break;
-				case WL_DISCONNECTED:
-					ledON();
-					TRACE("%s: WiFi disconnected, connect again\n", __func__);
-					WiFi.mode(WIFI_STA);
-					WiFi.begin(ssid, password);
-					reconnect_timeout = millis() + 10000;
-					break;
-				case WL_CONNECTION_LOST:
-					ledON();
-					TRACE("%s: WiFi connection lost, restart", __func__);
-					WiFi.reconnect();
-					reconnect_timeout = millis() + 10000;
-					break;
-				case WL_IDLE_STATUS:
-					reconnect_timeout = millis() + 10000;
-					break;
-				default:
-					reconnect_timeout = 0;
-					WiFi.disconnect(true);
-					ledOFF();
-					data_next += interval_sec;
-					deep_sleep(); // give up, wait one data interval
-					break;
-			}
-			delay(100);
-			wifi_trace(WiFi.status());
-			if (wifi_retry_count++ == 5)
-			{
-				TRACE("\n%s: no WLAN connection, retry count %u force reset\n", __func__, wifi_retry_count);
-				ESP.reset();
-			}
-		} else {
-			TRACE(".");
-			delay(100);
-		}
-		return;
-	}
-	if (reconnect_timeout)
-	{
-		TRACE("%s WiFI connected on %s channel%u, IP: %s\n", __func__, WiFi.SSID().c_str(), WiFi.channel(), WiFi.localIP().toString().c_str());
-		reconnect_timeout = 0;
-		wifi_retry_count = 0;
-		ledOFF();
-	}
-	// we are connected with WiFi here
-
 #ifdef WEBSERVER
-	server.handleClient();
+	if (WL_CONNECTED == WiFi.status())
+	{
+		server.handleClient();
+	} else {
+		server.stop();
+	}
 #endif /* WEBSERVER */
 #ifdef WITH_OTA
 	ArduinoOTA.handle();
@@ -919,12 +928,13 @@ void loop()
 	{
 		if (client.connected())
 		{  // await the data answer
-			while (client.available()) { char c = client.read(); TRACE("%c", c); }
+			while (client.available()) { char c = client.read(); TRACE("%c", c); client_error = 0; }
 			if (client_timeout < millis())
 			{
 				client_timeout = 0;
+				client_error++;
 				client.stop();
-				TRACE("%s client connection closed (timeout at %lu)\n", __func__, millis);
+				TRACE("%s client connection closed (timeout at %lu)\n", __func__, millis());
 			}
 		} else {
 				TRACE("%s client connection finished at %lu\n", __func__, millis());
@@ -937,16 +947,9 @@ void loop()
 
 	if (millis() >= data_next)
 	{ // sensor time
-#ifdef USE_DS18B20
-		if (!requested) { requested = true; DS18B20.requestTemperatures(); }
-#endif
 		if (sensorRead())
 		{
-#ifdef CLIENT
-			data_next = client_error ? (millis() + 10000) : ((data_overrun * interval_sec * data_max + (data_index + 1) * interval_sec) * 1000);
-#else
 			data_next = (data_overrun * interval_sec * data_max + (data_index + 1) * interval_sec) * 1000;
-#endif
 			TRACE("%s: now:%lu next sensor read %lu\n", __func__, millis(), data_next);
 			return;
 		} else {
@@ -954,12 +957,83 @@ void loop()
 			data_next = millis() + 4000;
 #endif
 #ifdef USE_DS18B20
-			data_next = millis() + 10;
-
+			delay(10);
+			return;
 #endif
 		}
 	}
+
+#ifdef LIGHT_SLEEP
+	/** Check WiFi connection */
+	if (WL_CONNECTED != WiFi.status())
+	{
+		if (!reconnect_timeout)
+		{
+			TRACE("%s: WiFi disconnected, await reconnection on ", __func__); wifi_trace(WiFi.status());
+			reconnect_timeout = millis() + 60000;
+		} else if (WIFI_STA != WiFi.getMode()) {
+			setupWiFi();
+			reconnect_timeout = millis() + 20000;
+		} else if (reconnect_timeout < millis()) {
+			TRACE("\n%s: WiFi no WLAN connection (retry %u) on ", __func__, wifi_retry_count); wifi_trace(WiFi.status());
+			switch(WiFi.status())
+			{
+				case WL_CONNECTED:
+					break;
+				case WL_DISCONNECTED:
+					ledON();
+					TRACE("%s: WiFi disconnected, connect again\n", __func__);
+					setupWiFi();
+					reconnect_timeout = millis() + 20000;
+					break;
+				case WL_CONNECTION_LOST:
+					ledON();
+					TRACE("%s: WiFi connection lost, restart", __func__);
+					WiFi.reconnect();
+					reconnect_timeout = millis() + 20000;
+					break;
+				case WL_IDLE_STATUS:
+					reconnect_timeout = millis() + 20000;
+					break;
+				case WL_NO_SSID_AVAIL:
+					WiFi.mode(WIFI_OFF);
+					delay(10000); // give up, wait
+					reconnect_timeout = millis() + 20000;
+					break;
+				default:
+					reconnect_timeout = 0;
+					WiFi.disconnect(true);
+					ledOFF();
+					delay(10000); // give up, wait
+					break;
+			}
+			delay(100);
+			if (wifi_retry_count++ == 3)
+			{
+				TRACE("\n%s: no WLAN connection, retry count %u force reset on", __func__, wifi_retry_count);
+				wifi_trace(WiFi.status());
+				ESP.reset();
+			}
+		} else {
+			TRACE(".");
+			delay(1000);
+		}
+		return;
+	}
+	if (reconnect_timeout)
+	{
+		TRACE("\n%s WiFI connected on %s channel%u, IP: %s\n", __func__, WiFi.SSID().c_str(), WiFi.channel(), WiFi.localIP().toString().c_str());
+		reconnect_timeout = 0;
+		wifi_retry_count = 0;
+#ifdef WEBSERVER
+		server.begin();
+#endif /* WEBSERVER */
+		ledOFF();
+	}
+	// we are connected with WiFi here
+#endif /* LIGHT_SLEEP */
+
 	ledOFF();
-	deep_sleep();
+	deep_sleep(data_next - millis());
 }
 
