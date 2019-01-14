@@ -9,17 +9,16 @@
  */
 
 /*** Personal parameter adaptations ***/
-
 #define WITH_UDP_LOG_PORT 2108		/** activates UDP logging */
 #define WITH_LED D4					/** activate the onboard LED for testing, use the given LED */
 #define WITH_SERIAL					/** activate the serial printings for testing */
 #define WITH_OTA					/**< Integrate over the air update (not on S0) */
-#undef USE_DHT						/**< DTH sensor used */
-#define USE_DS18B20					/**< DS18B20 sensor used */
+#define USE_DHT						/**< DTH sensor used */
+#undef USE_DS18B20					/**< DS18B20 sensor used */
 #define WITH_ADC					/**< VCC messure */
 #define VERSION "0.1"				/**< Version */ 
-#define BUILD 31					/**< Build number */ 
-#define LOCATION "Testsensor2"
+#define BUILD 34					/**< Build number */ 
+#define LOCATION "Wohnzimmer"
 #define WITH_IR_REC_PIN D6			/**< IR receiver pin */
 #define WITH_IR_SEND_PIN D5			/**< IR sender pin */
 #define WITH_RF_REC_PIN D2			/**< ISR number of the RF receiver */
@@ -132,6 +131,7 @@ static const int sensors_max = 1;        /* max supported sensors */
 #ifdef USE_DHT
 #include <DHT.h>
 static DHT dht(TEMPERATURE_SENSOR_PIN, DHT22);
+static float humidity[sensors_max];			/**< read humidity field */
 #endif /* USE_DHT */
 #ifdef USE_DS18B20
 #include <OneWire.h>
@@ -140,11 +140,11 @@ static OneWire oneWire(TEMPERATURE_SENSOR_PIN);
 static DallasTemperature DS18B20(&oneWire);
 static uint8_t numberOfDevices;              /** connected temperature devices */
 static DeviceAddress devAddr[sensors_max];
-static boolean requested;
+static boolean sensor_requested;
 #endif /* USE_DS18B20 */
 static unsigned long data_next;					/**< absolute time to read the sensor (millis value) */
 static const unsigned long interval_sec = 60;	/**< delay for reading the sensor (millis value) */
-static float temperature[sensors_max];			/**< read temerature field */
+static float temperature[sensors_max];			/**< read temperature field */
 
 //static IPAddress weather_server(192,168,178,31);
 static const char* weather_server = "raspi.fritz.box";
@@ -348,30 +348,44 @@ static void transmit_msg(float temperature, float humidity)
 #ifdef USE_DS18B20
 static bool sensorRead()
 {
+	static unsigned sensor_errors = 0;       /* error counter for sensors */
 	bool ret = true;
 	ledON();
-	if (!requested)
+	if (!sensor_requested)
 	{ 
+			if (sensor_errors) { setupDS18B20(); }
 			TRACE("%s: sensor data request at %lu\n", __func__, millis());
-			requested = true;
+			sensor_requested = true;
 			DS18B20.requestTemperatures();
 	}
 	if (!DS18B20.isConversionComplete()) 
 	{ 
 		if (data_next + 5000 < millis())
 		{
-			TRACE("%s: sensor data request failed at %lu - skipping\n", __func__, millis());
-			requested = false;
+			if (sensor_errors++ >= 3) 
+			{
+				TRACE("%s: sensor data request failed at %lu - reboot\n", __func__, millis());
+				ESP.reset();
+			}
+			TRACE("%s: sensor data request failed (%u) at %lu - skipping\n", __func__, sensor_errors, millis());
+			sensor_requested = false;
+#ifdef SENSOR_VCC_PIN
+			digitalWrite(SENSOR_VCC_PIN, LOW);
+#endif /* SENSOR_VCC_PIN */
 		} else {
 			ret = false;
 		}
 	} else {
-		requested = false;
+		sensor_requested = false;
 		for(unsigned i = 0; i < numberOfDevices; i++)
 		{
 			temperature[i] = DS18B20.getTempC(devAddr[i]);
 			TRACE("Sensor %d Temperatur: %.1f°C RSSI:%d\n", i+1, temperature[i], WiFi.RSSI());
-			if (0 == i) { transmit_msg(temperature[0], -1); }
+			if (0 == i)
+			{ 
+				transmit_msg(temperature[0], -1);
+				sensor_errors = 0;
+			}
 		}
 	}
 	ledOFF();
@@ -382,6 +396,7 @@ static bool sensorRead()
 #ifdef USE_DHT
 static bool sensorRead()
 {
+	static unsigned sensor_errors = 0;       /* error counter for sensors */
 	bool ret = true;
 	ledON();
 
@@ -391,11 +406,14 @@ static bool sensorRead()
 	{
 		temperature[0] = t;
 		humidity[0] = h;
-#ifdef CLIENT
 		transmit_msg(t, h);
-#endif /* CLIENT */
-		TRACE("Sensor DHT Temperatur: %.1f°C humidity %.1%% RSSI:%d\n", t, h, WiFi.RSSI());
+		TRACE("Sensor DHT Temperatur: %.1f°C humidity %.1f%% RSSI:%d\n", t, h, WiFi.RSSI());
 	} else {
+		if (sensor_errors++ >= 3) 
+		{
+			TRACE("%s: sensor data request failed at %lu - reboot\n", __func__, millis());
+			ESP.reset();
+		}
 		TRACE("%s: reading DHT sensor failed at %lu, try again\n", __func__, millis());
 #ifdef SENSOR_VCC_PIN
 		digitalWrite(SENSOR_VCC_PIN, LOW);
@@ -522,7 +540,12 @@ static void onTemperature()
 static void onHumidity()
 {
 	ledON();
-	snprintf(web_server.buf, sizeof(web_server.buf), "%d.%d\n", data[0][data_index].hum / 10, data[0][data_index].hum % 10);
+	unsigned len = 0;
+	for(int i = 0; i < sensors_max; i++)
+	{
+		len = snprintf(web_server.buf+len, sizeof(web_server.buf)-len, "%.1f\n", humidity[i]);
+	}
+	web_server.send(200, "text/plain", web_server.buf);
 	web_server.send( 200, "text/plain", web_server.buf);
 	TRACE_LINE(web_server.buf);
 	ledOFF();
@@ -726,7 +749,7 @@ static void setupDS18B20()
 	data_next = millis() + 2000;
 	DS18B20.setWaitForConversion(true);
 	DS18B20.requestTemperatures();
-	requested = true;
+	sensor_requested = true;
 
 	// Loop through each device, print out address
 	for(int i=0, d=0; d < devs; d++)
@@ -1151,11 +1174,11 @@ void loop()
 
 // connect data pin of rx433 module to a pin that can handle hardware interrupts
 // with an Arduino UNO this is digital I/O pin 2 or 3 only
-#define RX433DATAPIN D3
+#define RX433DATAPIN D1
 
 // hardware interrupt connected to the pin
 // with Arduino UNO interrupt-0 belongs to pin-2, interrupt-1 to pin-3
-#define RX433INTERRUPT 0
+#define RX433INTERRUPT digitalPinToInterrupt(RX433DATAPIN)
 
 // Set speed of serial in Arduino IDE to the following value
 #define SERIALSPEED 115200
